@@ -41,6 +41,13 @@ class BaseBehavior:
     def context(self) -> str:
         return f"mode={self.name} target={self.target}".strip()
 
+    def postprocess_action(self, action: str) -> str:
+        """
+        Optional hook for behaviors to bias or modify actions
+        (e.g., anti-loop, curiosity bias, safety filters).
+        """
+        return action
+
     def run(self) -> None:
         end_t = time.time() + (self.duration_minutes * 60)
         self.logger.info(f"Starting behavior '{self.name}' for {self.duration_minutes} min")
@@ -55,7 +62,9 @@ class BaseBehavior:
                 continue
 
             last_capture = now
-            pil, b64, path = self.camera.capture(save=bool(self.config.get("logging_settings", {}).get("save_images", True)))
+            pil, b64, path = self.camera.capture(
+                save=bool(self.config.get("logging_settings", {}).get("save_images", True))
+            )
             if b64 is None:
                 self.logger.warning("No camera frame; stopping")
                 self.robot.execute("stop", 0.3)
@@ -70,6 +79,12 @@ class BaseBehavior:
                 target=self.target,
             )
 
+            # --- NEW: behavior-level action postprocessing ---
+            action = decision.get("action", "stop")
+            action = self.postprocess_action(action)
+            duration_s = float(decision.get("duration_s", 0.6))
+            # -------------------------------------------------
+
             record = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "mode": self.name,
@@ -83,6 +98,7 @@ class BaseBehavior:
                     "processing_time_s": analysis.processing_time_s,
                 },
                 "decision": decision,
+                "executed_action": action,
             }
             if bool(self.config.get("logging_settings", {}).get("save_decisions", True)):
                 self.decisions_path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,7 +108,8 @@ class BaseBehavior:
             if self.verbose:
                 self.logger.info(f"Seen: {analysis.description}")
                 self.logger.info(f"Decision: {decision}")
+                self.logger.info(f"Executing: {action} ({duration_s:.2f}s)")
 
-            self.robot.execute(decision.get("action", "stop"), float(decision.get("duration_s", 0.6)))
+            self.robot.execute(action, duration_s)
 
         self.logger.info(f"Behavior '{self.name}' complete")
