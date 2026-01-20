@@ -4,13 +4,12 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Deque
+from collections import deque
 
-from ai.vision_ai import AIVisionSystem, SceneAnalysis
+from ai.vision_ai import AIVisionSystem
 from core.robot_controller import RobotController
 from vision.camera import CameraSystem
-
-# Voice (OpenAI TTS) — new module you’ll add at voice/voice_system.py
 from voice.voice_system import VoiceSystem
 
 
@@ -38,14 +37,21 @@ class BaseBehavior:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.decisions_path = Path("logs") / "decisions.jsonl"
 
-        # Voice system (safe: will no-op if disabled or if TTS fails)
+        # Voice system (safe: no-op if disabled)
         self.voice = VoiceSystem(config)
 
-        # Narration throttling (separate from VoiceSystem cooldown)
+        # Narration throttling
         vs = config.get("voice_settings", {}) if isinstance(config, dict) else {}
         self._narration_enabled = bool(vs.get("enabled", True)) and bool(vs.get("narration_enabled", True))
         self._narration_min_interval_s = float(vs.get("narration_min_interval_s", 4.0))
         self._last_narration_at = 0.0
+
+        # --- Curiosity / anti-loop state ---
+        self._recent_actions: Deque[str] = deque(maxlen=5)
+        self._repeat_threshold = 3
+        # ----------------------------------
+
+    # -----------------------------------------------------
 
     def available_actions(self) -> List[str]:
         return ["forward", "turn_left", "turn_right", "backward", "stop"]
@@ -53,15 +59,62 @@ class BaseBehavior:
     def context(self) -> str:
         return f"mode={self.name} target={self.target}".strip()
 
+    # -----------------------------------------------------
+    # 🧠 Curiosity / anti-loop logic lives here
+    # -----------------------------------------------------
+
     def postprocess_action(self, action: str) -> str:
         """
-        Optional hook for behaviors to bias or modify actions
-        (e.g., anti-loop, curiosity bias, safety filters).
+        Bias actions to avoid getting stuck in loops.
+        Never overrides 'stop'.
         """
+        if action == "stop":
+            return action
+
+        self._recent_actions.append(action)
+
+        # Not enough history yet
+        if len(self._recent_actions) < self._repeat_threshold:
+            return action
+
+        # Detect same-action repetition
+        last_actions = list(self._recent_actions)[-self._repeat_threshold :]
+        if all(a == action for a in last_actions):
+            return self._curiosity_override(action)
+
+        # Detect oscillation: left-right-left-right
+        if len(self._recent_actions) >= 4:
+            a, b, c, d = list(self._recent_actions)[-4:]
+            if a == c and b == d and a != b:
+                return self._curiosity_override(action)
+
         return action
 
+    def _curiosity_override(self, stuck_action: str) -> str:
+        """
+        Choose a different action when stuck.
+        """
+        self.logger.debug(f"Curiosity triggered (stuck on '{stuck_action}')")
+
+        # Prefer forward if we weren't already trying it
+        if stuck_action != "forward":
+            new_action = "forward"
+        else:
+            # Alternate turns
+            new_action = "turn_left" if stuck_action != "turn_left" else "turn_right"
+
+        # Narrate curiosity intervention
+        self._narrate("I seem to be stuck. Trying something different.", level="normal")
+
+        # Reset history slightly so we don't immediately re-trigger
+        self._recent_actions.clear()
+        self._recent_actions.append(new_action)
+
+        return new_action
+
+    # -----------------------------------------------------
+
     def _narrate(self, text: str, *, level: str = "normal", force: bool = False) -> None:
-        """Narration helper with extra rate-limit on top of VoiceSystem."""
         if not self._narration_enabled:
             return
         now = time.time()
@@ -70,15 +123,17 @@ class BaseBehavior:
         self.voice.say(text, level=level, force=force)
         self._last_narration_at = now
 
+    # -----------------------------------------------------
+
     def run(self) -> None:
         end_t = time.time() + (self.duration_minutes * 60)
         self.logger.info(f"Starting behavior '{self.name}' for {self.duration_minutes} min")
 
-        # Narrate start (force so you always hear mode changes)
-        mode_line = f"Starting {self.name} mode."
+        # Narrate start
+        start_line = f"Starting {self.name} mode."
         if self.target:
-            mode_line = f"Starting {self.name} mode. Target: {self.target}."
-        self._narrate(mode_line, level="normal", force=True)
+            start_line = f"Starting {self.name} mode. Target: {self.target}."
+        self._narrate(start_line, level="normal", force=True)
 
         capture_interval = float(self.config.get("camera_settings", {}).get("capture_interval_s", 2.5))
         last_capture = 0.0
@@ -102,7 +157,6 @@ class BaseBehavior:
 
             analysis = self.ai.analyze_scene(b64, context=self.context())
 
-            # If AI fell back, it will set description like "AI unavailable" / "AI error"
             if analysis.description in {"AI unavailable", "AI error"}:
                 self._narrate("I can't reach my AI right now. Stopping.", level="normal", force=True)
 
@@ -113,11 +167,9 @@ class BaseBehavior:
                 target=self.target,
             )
 
-            # --- behavior-level action postprocessing ---
             action = decision.get("action", "stop")
             action = self.postprocess_action(action)
             duration_s = float(decision.get("duration_s", 0.6))
-            # -----------------------------------------
 
             record = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -144,8 +196,7 @@ class BaseBehavior:
                 self.logger.info(f"Decision: {decision}")
                 self.logger.info(f"Executing: {action} ({duration_s:.2f}s)")
 
-            # Narration: action + a tiny bit of “thinking” (throttled)
-            # Keep it short and non-annoying.
+            # Narrate action
             if action == "forward":
                 self._narrate("Clear. Moving forward.", level="normal")
             elif action == "turn_left":
