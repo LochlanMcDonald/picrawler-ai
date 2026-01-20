@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 
 from openai import OpenAI, APIError, APITimeoutError, RateLimitError
 
+from voice.voice_system import VoiceSystem
+
 
 @dataclass
 class SceneAnalysis:
@@ -48,6 +50,25 @@ class AIVisionSystem:
         self.MIN_SECONDS_BETWEEN_CALLS = float(
             ai.get("min_seconds_between_calls", self.MIN_SECONDS_BETWEEN_CALLS)
         )
+
+        # Voice system (safe: will no-op if disabled or if TTS fails)
+        self.voice = VoiceSystem(config)
+
+        # Failure narration suppression
+        vs = config.get("voice_settings", {}) if isinstance(config, dict) else {}
+        self._ai_fail_speak_cooldown_s = float(vs.get("ai_failure_speak_cooldown_s", 25.0))
+        self._last_ai_fail_spoken_at: float = 0.0
+
+    def _speak_ai_failure_once(self, line: str) -> None:
+        """Speak an AI-failure line, but suppress repeats for a cooldown window."""
+        now = time.time()
+        if now - self._last_ai_fail_spoken_at < self._ai_fail_speak_cooldown_s:
+            return
+        try:
+            self.voice.say(line, level="normal")
+        except Exception:
+            pass
+        self._last_ai_fail_spoken_at = now
 
     def analyze_scene(self, image_base64: str, context: str) -> SceneAnalysis:
         """Return a structured summary of what the robot sees.
@@ -96,6 +117,7 @@ class AIVisionSystem:
 
         except (RateLimitError, APITimeoutError, APIError) as e:
             self.logger.error(f"OpenAI API failure: {e}")
+            self._speak_ai_failure_once("I can't reach my AI right now. Going safe.")
             analysis = SceneAnalysis(
                 description="AI unavailable",
                 objects=[],
@@ -110,6 +132,7 @@ class AIVisionSystem:
 
         except Exception as e:
             self.logger.exception("Unexpected error during AI analysis")
+            self._speak_ai_failure_once("My perception failed. Stopping to be safe.")
             analysis = SceneAnalysis(
                 description="AI error",
                 objects=[],
@@ -177,6 +200,7 @@ class AIVisionSystem:
             text = getattr(resp, "output_text", "") or ""
         except Exception as e:
             self.logger.error(f"Decision API error: {e}")
+            self._speak_ai_failure_once("Decision system is unstable. Stopping.")
             return {"action": "stop", "duration_s": 0.5, "reasoning": "AI failure", "_latency_s": time.time() - t0}
 
         dt = time.time() - t0
