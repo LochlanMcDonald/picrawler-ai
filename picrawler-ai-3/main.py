@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import sys
+import traceback
 
 from core.config_loader import load_config
 from core.logger import setup_logging
@@ -42,21 +43,24 @@ def main() -> int:
     # Warn if key missing (but allow dry-run test)
     api_key = config.get("openai_api_key")
     if (not api_key or api_key == "your-api-key-here") and not os.getenv("OPENAI_API_KEY"):
-        logger.warning("No OpenAI API key set. Set OPENAI_API_KEY env var or config/openai_api_key. AI calls will fail.")
+        logger.warning(
+            "No OpenAI API key set. Set OPENAI_API_KEY env var or config/openai_api_key. AI calls will fail."
+        )
 
-    # --- Quick improvement #1: Throttle AI calls to reduce cost/jitter ---
-    # Default to 3 seconds, overridable via config:
-    # "ai_settings": { "min_seconds_between_calls": 3.0 }
+    # --- Improvement #1: Throttle AI calls to reduce cost/jitter ---
     ai_settings = config.get("ai_settings", {})
     min_seconds_between_calls = float(ai_settings.get("min_seconds_between_calls", 3.0))
     AIVisionSystem.MIN_SECONDS_BETWEEN_CALLS = min_seconds_between_calls  # type: ignore[attr-defined]
-    # -------------------------------------------------------------------
+    # -------------------------------------------------------------
 
-    robot = RobotController(config)
-    camera = CameraSystem(config)
-    ai = AIVisionSystem(config)
+    robot: RobotController | None = None
+    camera: CameraSystem | None = None
 
     try:
+        robot = RobotController(config)
+        camera = CameraSystem(config)
+        ai = AIVisionSystem(config)
+
         if args.mode == "test":
             # Simple self-test: capture one frame and run one analysis
             _, b64, path = camera.capture(save=True)
@@ -65,7 +69,9 @@ def main() -> int:
                 return 2
             analysis = ai.analyze_scene(b64, context="self-test")
             logger.info(f"Saved frame: {path}")
-            logger.info(f"Analysis: {analysis.description} | objects={analysis.objects} | hazards={analysis.hazards}")
+            logger.info(
+                f"Analysis: {analysis.description} | objects={analysis.objects} | hazards={analysis.hazards}"
+            )
             return 0
 
         behaviors = {
@@ -88,18 +94,29 @@ def main() -> int:
         return 0
 
     except KeyboardInterrupt:
-        logger.info("Interrupted; stopping")
-        try:
-            robot.execute("stop", 0.2)
-        except Exception:
-            pass
+        logger.warning("Keyboard interrupt received — emergency stop engaged")
         return 130
 
+    except Exception as e:
+        logger.error("Unhandled exception — emergency stop engaged")
+        logger.error(str(e))
+        traceback.print_exc()
+        return 1
+
     finally:
-        try:
-            camera.close()
-        except Exception:
-            pass
+        # --- HARD SAFETY STOP (always runs) ---
+        if robot is not None:
+            try:
+                robot.execute("stop", 0.2)
+            except Exception:
+                pass
+
+        if camera is not None:
+            try:
+                camera.close()
+            except Exception:
+                pass
+        # -------------------------------------
 
 
 if __name__ == "__main__":
