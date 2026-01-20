@@ -25,6 +25,9 @@ class SceneAnalysis:
 
 
 class AIVisionSystem:
+    # Default throttle (seconds); can be overridden via config or main.py
+    MIN_SECONDS_BETWEEN_CALLS: float = 3.0
+
     def __init__(self, config: dict):
         self.logger = logging.getLogger(self.__class__.__name__)
         api_key = config.get("openai_api_key") or None
@@ -37,8 +40,29 @@ class AIVisionSystem:
         self.temperature = float(ai.get("temperature", 0.4))
         self.timeout_s = int(ai.get("request_timeout_s", 30))
 
+        # Throttling state
+        self._last_call_time: float = 0.0
+        self._last_analysis: Optional[SceneAnalysis] = None
+
+        # Allow config override
+        self.MIN_SECONDS_BETWEEN_CALLS = float(
+            ai.get("min_seconds_between_calls", self.MIN_SECONDS_BETWEEN_CALLS)
+        )
+
     def analyze_scene(self, image_base64: str, context: str) -> SceneAnalysis:
-        """Return a structured summary of what the robot sees."""
+        """Return a structured summary of what the robot sees.
+
+        Throttles calls to the OpenAI API and reuses the last analysis if called too soon.
+        """
+        now = time.time()
+        elapsed = now - self._last_call_time
+
+        if self._last_analysis is not None and elapsed < self.MIN_SECONDS_BETWEEN_CALLS:
+            self.logger.debug(
+                f"AI throttled: reusing last analysis ({elapsed:.2f}s < {self.MIN_SECONDS_BETWEEN_CALLS:.2f}s)"
+            )
+            return self._last_analysis
+
         prompt = (
             "You are a robotics perception module. Summarize what you see for navigation. "
             "Be concise, grounded, and action-oriented.\n\n"
@@ -70,7 +94,7 @@ class AIVisionSystem:
         text = getattr(resp, "output_text", "") or ""
 
         data = self._safe_json(text)
-        return SceneAnalysis(
+        analysis = SceneAnalysis(
             description=str(data.get("description", "")) if isinstance(data, dict) else "",
             objects=list(data.get("objects", [])) if isinstance(data, dict) else [],
             hazards=list(data.get("hazards", [])) if isinstance(data, dict) else [],
@@ -78,6 +102,12 @@ class AIVisionSystem:
             raw=text,
             processing_time_s=dt,
         )
+
+        # Update throttle cache
+        self._last_call_time = now
+        self._last_analysis = analysis
+
+        return analysis
 
     def decide_action(
         self,
@@ -148,5 +178,5 @@ class AIVisionSystem:
         try:
             return json.loads(s)
         except Exception:
-            self.logger.warning("Model output was not valid JSON; returning raw text")
-            return {"description": "", "objects": [], "hazards": [], "suggested_actions": [], "raw": text}
+            self.logger.warning("Model output was not valid JSON; returning empty structure")
+            return {"description": "", "objects": [], "hazards": [], "suggested_actions": []}
