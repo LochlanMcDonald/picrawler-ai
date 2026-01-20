@@ -32,6 +32,8 @@ class AIVisionSystem:
 
     def __init__(self, config: dict):
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.config = config  # keep for dialogue/personality access
+
         api_key = config.get("openai_api_key") or None
         # Also allow OPENAI_API_KEY env var automatically via SDK
         self.client = OpenAI(api_key=None if (api_key in (None, "", "your-api-key-here")) else api_key)
@@ -59,6 +61,14 @@ class AIVisionSystem:
         self._ai_fail_speak_cooldown_s = float(vs.get("ai_failure_speak_cooldown_s", 25.0))
         self._last_ai_fail_spoken_at: float = 0.0
 
+        # ---- AI dialogue throttle/dedupe state (new) ----
+        self._last_dialogue_at: float = 0.0
+        self._last_dialogue_text: Optional[str] = None
+        self._last_dialogue_text_at: float = 0.0
+        # -----------------------------------------------
+
+    # -----------------------------------------------------
+
     def _speak_ai_failure_once(self, line: str) -> None:
         """Speak an AI-failure line, but suppress repeats for a cooldown window."""
         now = time.time()
@@ -69,6 +79,10 @@ class AIVisionSystem:
         except Exception:
             pass
         self._last_ai_fail_spoken_at = now
+
+    # -----------------------------------------------------
+    # Vision analysis
+    # -----------------------------------------------------
 
     def analyze_scene(self, image_base64: str, context: str) -> SceneAnalysis:
         """Return a structured summary of what the robot sees.
@@ -163,6 +177,10 @@ class AIVisionSystem:
 
         return analysis
 
+    # -----------------------------------------------------
+    # Decision
+    # -----------------------------------------------------
+
     def decide_action(
         self,
         analysis: SceneAnalysis,
@@ -223,6 +241,133 @@ class AIVisionSystem:
             "reasoning": str(data.get("reasoning", "")),
             "_latency_s": dt,
         }
+
+    # -----------------------------------------------------
+    # 🗣️ AI-generated dialogue (new)
+    # -----------------------------------------------------
+
+    def generate_dialogue(
+        self,
+        *,
+        mode: str,
+        target: Optional[str],
+        analysis: SceneAnalysis,
+        decision: Dict[str, Any],
+        executed_action: str,
+    ) -> str:
+        """
+        Generate a short, personality-driven line of dialogue suitable for TTS.
+
+        Safety + constraints:
+          - short (<= ~20 words)
+          - grounded in the analysis
+          - no unsafe instructions
+          - no mention of policies/system prompts
+        Throttled + deduped internally.
+        """
+        vs = self.config.get("voice_settings", {}) if isinstance(self.config, dict) else {}
+        enabled = bool(vs.get("enabled", True)) and bool(vs.get("dialogue_enabled", True))
+        if not enabled:
+            return ""
+
+        # Throttle (separate from BaseBehavior throttling)
+        now = time.time()
+        min_interval_s = float(vs.get("dialogue_min_interval_s", 10.0))
+        if (now - self._last_dialogue_at) < min_interval_s:
+            return ""
+
+        dedupe_window_s = float(vs.get("dialogue_dedupe_window_s", 30.0))
+        if (
+            self._last_dialogue_text
+            and (now - self._last_dialogue_text_at) < dedupe_window_s
+            and self._last_dialogue_text.strip()
+        ):
+            # we still allow new dialogue; dedupe check below prevents exact repeats
+            pass
+
+        # Personality (simple, explicit, editable)
+        personality = self.config.get("personality_settings", {}) if isinstance(self.config, dict) else {}
+        style = str(personality.get("style", "curious, analytical"))
+        name = str(personality.get("name", "Nimue"))
+        humor = str(personality.get("humor", "dry")).strip()
+
+        # Keep it tight
+        max_words = int(personality.get("max_words", 20))
+
+        # Build a compact context object for the model
+        ctx = {
+            "name": name,
+            "style": style,
+            "humor": humor,
+            "mode": mode,
+            "target": target,
+            "what_i_see": analysis.description,
+            "hazards": analysis.hazards[:4],
+            "objects": analysis.objects[:6],
+            "suggested": analysis.suggested_actions[:4],
+            "decision": {
+                "action": decision.get("action"),
+                "duration_s": decision.get("duration_s"),
+                "reasoning": decision.get("reasoning", "")[:220],
+            },
+            "executed_action": executed_action,
+        }
+
+        prompt = (
+            "You are the robot's inner voice. Produce ONE short spoken line for text-to-speech.\n"
+            f"- Persona: {style}\n"
+            f"- Name: {name}\n"
+            f"- Max words: {max_words}\n"
+            "- Requirements: grounded in what you see; mention a relevant object or hazard; "
+            "reflect intent; keep it safe.\n"
+            "- Do NOT output JSON. Output only the spoken sentence.\n\n"
+            f"Context:\n{json.dumps(ctx)}"
+        )
+
+        t0 = time.time()
+        try:
+            resp = self.client.responses.create(
+                model=self.model,
+                max_output_tokens=80,
+                temperature=min(self.temperature, 0.6),
+                input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+                timeout=self.timeout_s,
+            )
+            text = (getattr(resp, "output_text", "") or "").strip()
+        except (RateLimitError, APITimeoutError, APIError) as e:
+            self.logger.debug(f"Dialogue API failure (non-fatal): {e}")
+            self._last_dialogue_at = now
+            return ""
+        except Exception as e:
+            self.logger.debug(f"Dialogue error (non-fatal): {e}")
+            self._last_dialogue_at = now
+            return ""
+
+        # Clean up: keep first line, strip quotes, enforce length
+        line = text.splitlines()[0].strip().strip('"').strip("'")
+        if not line:
+            self._last_dialogue_at = now
+            return ""
+
+        # Enforce word cap (hard)
+        words = line.split()
+        if len(words) > max_words:
+            line = " ".join(words[:max_words]).rstrip(" ,.;:") + "."
+
+        # Dedupe exact repeats
+        if self._last_dialogue_text == line and (now - self._last_dialogue_text_at) < dedupe_window_s:
+            self._last_dialogue_at = now
+            return ""
+
+        # Update state
+        self._last_dialogue_at = now
+        self._last_dialogue_text = line
+        self._last_dialogue_text_at = now
+
+        self.logger.debug(f"Dialogue generated in {time.time() - t0:.2f}s: {line}")
+        return line
+
+    # -----------------------------------------------------
 
     def _safe_json(self, text: str) -> Any:
         """Best-effort JSON parse (handles code fences)."""
