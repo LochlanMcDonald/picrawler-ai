@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import time
-from pathlib import Path
-from typing import List, Optional, Deque
 from collections import deque
+from pathlib import Path
+from typing import Deque, List, Optional
 
 from ai.vision_ai import AIVisionSystem
 from core.robot_controller import RobotController
@@ -45,6 +45,16 @@ class BaseBehavior:
         self._narration_enabled = bool(vs.get("enabled", True)) and bool(vs.get("narration_enabled", True))
         self._narration_min_interval_s = float(vs.get("narration_min_interval_s", 4.0))
         self._last_narration_at = 0.0
+
+        # --- AI Dialogue settings (new) ---
+        # Separate from "narration" so you can have either/both.
+        self._dialogue_enabled = bool(vs.get("enabled", True)) and bool(vs.get("dialogue_enabled", True))
+        self._dialogue_min_interval_s = float(vs.get("dialogue_min_interval_s", 10.0))
+        self._last_dialogue_at = 0.0
+        self._last_dialogue_text: Optional[str] = None
+        self._dialogue_dedupe_window_s = float(vs.get("dialogue_dedupe_window_s", 30.0))
+        self._last_dialogue_text_at = 0.0
+        # ---------------------------------
 
         # --- Curiosity / anti-loop state ---
         self._recent_actions: Deque[str] = deque(maxlen=5)
@@ -101,7 +111,7 @@ class BaseBehavior:
             new_action = "forward"
         else:
             # Alternate turns
-            new_action = "turn_left" if stuck_action != "turn_left" else "turn_right"
+            new_action = "turn_left"
 
         # Narrate curiosity intervention
         self._narrate("I seem to be stuck. Trying something different.", level="normal")
@@ -122,6 +132,57 @@ class BaseBehavior:
             return
         self.voice.say(text, level=level, force=force)
         self._last_narration_at = now
+
+    def _speak_dialogue(self, analysis, decision: dict, executed_action: str) -> None:
+        """
+        AI-generated dialogue (short, personality-driven).
+        This is throttled and deduped separately from narration.
+        Safe: non-fatal if unavailable.
+        """
+        if not self._dialogue_enabled:
+            return
+
+        now = time.time()
+        if (now - self._last_dialogue_at) < self._dialogue_min_interval_s:
+            return
+
+        # Dedupe identical line within window
+        if (
+            self._last_dialogue_text
+            and (now - self._last_dialogue_text_at) < self._dialogue_dedupe_window_s
+        ):
+            # We'll still allow new dialogue; this block only prevents repeating the exact same line.
+            pass
+
+        # Only attempt if the AI system exposes the method (we’ll add it in ai/vision_ai.py next)
+        if not hasattr(self.ai, "generate_dialogue"):
+            return
+
+        try:
+            line = self.ai.generate_dialogue(  # type: ignore[attr-defined]
+                mode=self.name,
+                target=self.target,
+                analysis=analysis,
+                decision=decision,
+                executed_action=executed_action,
+            )
+            line = (line or "").strip()
+            if not line:
+                return
+
+            if self._last_dialogue_text == line and (now - self._last_dialogue_text_at) < self._dialogue_dedupe_window_s:
+                return
+
+            # Speak it (force=False so VoiceSystem cooldown/dedupe still apply)
+            self.voice.say(line, level="normal", force=False)
+
+            self._last_dialogue_at = now
+            self._last_dialogue_text = line
+            self._last_dialogue_text_at = now
+
+        except Exception as e:
+            self.logger.debug(f"Dialogue generation failed (non-fatal): {e}")
+            self._last_dialogue_at = now  # prevent hammering on repeated failures
 
     # -----------------------------------------------------
 
@@ -196,7 +257,7 @@ class BaseBehavior:
                 self.logger.info(f"Decision: {decision}")
                 self.logger.info(f"Executing: {action} ({duration_s:.2f}s)")
 
-            # Narrate action
+            # Simple narration (short)
             if action == "forward":
                 self._narrate("Clear. Moving forward.", level="normal")
             elif action == "turn_left":
@@ -207,6 +268,9 @@ class BaseBehavior:
                 self._narrate("Backing up.", level="normal")
             elif action == "stop":
                 self._narrate("Stopping.", level="normal")
+
+            # NEW: AI-generated dialogue line (throttled)
+            self._speak_dialogue(analysis, decision, action)
 
             self.robot.execute(action, duration_s)
 
