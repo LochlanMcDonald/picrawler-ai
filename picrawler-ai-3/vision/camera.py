@@ -18,6 +18,9 @@ from typing import Optional, Tuple
 
 from PIL import Image, ImageChops, ImageStat
 
+# Voice (optional)
+from voice.voice_system import VoiceSystem
+
 
 class CameraSystem:
     def __init__(self, config: dict, save_dir: str = "logs/images"):
@@ -35,6 +38,9 @@ class CameraSystem:
 
         self._last_panic_time: float = 0.0
         self._prev_image: Optional[Image.Image] = None
+
+        # Voice system (safe: no-op if disabled or fails)
+        self.voice = VoiceSystem(config)
 
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -109,6 +115,16 @@ class CameraSystem:
             self.logger.warning(
                 f"PANIC: sudden visual change detected (Δ={mean_diff:.1f} ≥ {self.panic_threshold})"
             )
+
+            # Narrate panic once
+            try:
+                self.voice.say(
+                    "That changed suddenly. Stopping.",
+                    level="normal",
+                )
+            except Exception:
+                pass
+
             return True
 
         return False
