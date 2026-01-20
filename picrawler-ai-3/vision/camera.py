@@ -4,6 +4,7 @@ Preferred on Pi: Picamera2
 Fallback: OpenCV VideoCapture
 
 Returns both a PIL Image and a base64-encoded JPEG suitable for OpenAI vision.
+Includes panic-stop detection on sudden visual change.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
 
 class CameraSystem:
@@ -26,6 +27,14 @@ class CameraSystem:
         self.quality = int(cs.get("image_quality", 85))
         self.flip_h = bool(cs.get("flip_h", False))
         self.flip_v = bool(cs.get("flip_v", False))
+
+        # Panic detection settings
+        self.enable_panic = bool(cs.get("panic_on_visual_change", True))
+        self.panic_threshold = float(cs.get("panic_change_threshold", 35.0))
+        self.panic_cooldown_s = float(cs.get("panic_cooldown_s", 1.0))
+
+        self._last_panic_time: float = 0.0
+        self._prev_image: Optional[Image.Image] = None
 
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -66,6 +75,44 @@ class CameraSystem:
             self.logger.error(f"No camera backend available: {e}")
             self._cv = None
 
+    def _detect_panic(self, img: Image.Image) -> bool:
+        """Return True if sudden visual change is detected."""
+        if not self.enable_panic:
+            self._prev_image = img
+            return False
+
+        now = time.time()
+        if now - self._last_panic_time < self.panic_cooldown_s:
+            self._prev_image = img
+            return False
+
+        if self._prev_image is None:
+            self._prev_image = img
+            return False
+
+        try:
+            # Convert to grayscale and compute mean absolute difference
+            diff = ImageChops.difference(
+                self._prev_image.convert("L"),
+                img.convert("L"),
+            )
+            stat = ImageStat.Stat(diff)
+            mean_diff = stat.mean[0]
+        except Exception:
+            self._prev_image = img
+            return False
+
+        self._prev_image = img
+
+        if mean_diff >= self.panic_threshold:
+            self._last_panic_time = now
+            self.logger.warning(
+                f"PANIC: sudden visual change detected (Δ={mean_diff:.1f} ≥ {self.panic_threshold})"
+            )
+            return True
+
+        return False
+
     def capture(self, save: bool = True) -> Tuple[Optional[Image.Image], Optional[str], Optional[str]]:
         """Capture an image.
 
@@ -102,6 +149,11 @@ class CameraSystem:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
         if self.flip_v:
             img = img.transpose(Image.FLIP_TOP_BOTTOM)
+
+        # --- PANIC DETECTION ---
+        if self._detect_panic(img):
+            return None, None, None
+        # ----------------------
 
         # JPEG encode
         buf = io.BytesIO()
