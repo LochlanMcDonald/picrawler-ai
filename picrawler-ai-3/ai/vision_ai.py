@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from openai import OpenAI
+from openai import OpenAI, APIError, APITimeoutError, RateLimitError
 
 
 @dataclass
@@ -53,6 +53,7 @@ class AIVisionSystem:
         """Return a structured summary of what the robot sees.
 
         Throttles calls to the OpenAI API and reuses the last analysis if called too soon.
+        Falls back safely on API failure.
         """
         now = time.time()
         elapsed = now - self._last_call_time
@@ -72,28 +73,58 @@ class AIVisionSystem:
         )
 
         t0 = time.time()
-        resp = self.client.responses.create(
-            model=self.model,
-            max_output_tokens=self.max_output_tokens,
-            temperature=self.temperature,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/jpeg;base64,{image_base64}",
-                        },
-                    ],
-                }
-            ],
-            timeout=self.timeout_s,
-        )
-        dt = time.time() - t0
-        text = getattr(resp, "output_text", "") or ""
+        try:
+            resp = self.client.responses.create(
+                model=self.model,
+                max_output_tokens=self.max_output_tokens,
+                temperature=self.temperature,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/jpeg;base64,{image_base64}",
+                            },
+                        ],
+                    }
+                ],
+                timeout=self.timeout_s,
+            )
+            text = getattr(resp, "output_text", "") or ""
 
+        except (RateLimitError, APITimeoutError, APIError) as e:
+            self.logger.error(f"OpenAI API failure: {e}")
+            analysis = SceneAnalysis(
+                description="AI unavailable",
+                objects=[],
+                hazards=[],
+                suggested_actions=["stop"],
+                raw=str(e),
+                processing_time_s=time.time() - t0,
+            )
+            self._last_call_time = now
+            self._last_analysis = analysis
+            return analysis
+
+        except Exception as e:
+            self.logger.exception("Unexpected error during AI analysis")
+            analysis = SceneAnalysis(
+                description="AI error",
+                objects=[],
+                hazards=[],
+                suggested_actions=["stop"],
+                raw=str(e),
+                processing_time_s=time.time() - t0,
+            )
+            self._last_call_time = now
+            self._last_analysis = analysis
+            return analysis
+
+        dt = time.time() - t0
         data = self._safe_json(text)
+
         analysis = SceneAnalysis(
             description=str(data.get("description", "")) if isinstance(data, dict) else "",
             objects=list(data.get("objects", [])) if isinstance(data, dict) else [],
@@ -135,15 +166,20 @@ class AIVisionSystem:
         }
 
         t0 = time.time()
-        resp = self.client.responses.create(
-            model=self.model,
-            max_output_tokens=min(self.max_output_tokens, 500),
-            temperature=self.temperature,
-            input=[{"role": "user", "content": [{"type": "input_text", "text": json.dumps(prompt)}]}],
-            timeout=self.timeout_s,
-        )
+        try:
+            resp = self.client.responses.create(
+                model=self.model,
+                max_output_tokens=min(self.max_output_tokens, 500),
+                temperature=self.temperature,
+                input=[{"role": "user", "content": [{"type": "input_text", "text": json.dumps(prompt)}]}],
+                timeout=self.timeout_s,
+            )
+            text = getattr(resp, "output_text", "") or ""
+        except Exception as e:
+            self.logger.error(f"Decision API error: {e}")
+            return {"action": "stop", "duration_s": 0.5, "reasoning": "AI failure", "_latency_s": time.time() - t0}
+
         dt = time.time() - t0
-        text = getattr(resp, "output_text", "") or ""
         data = self._safe_json(text)
 
         if not isinstance(data, dict):
@@ -168,11 +204,9 @@ class AIVisionSystem:
         """Best-effort JSON parse (handles code fences)."""
         s = text.strip()
         if "```" in s:
-            # pick first fenced block
             parts = s.split("```")
             if len(parts) >= 2:
                 s = parts[1].strip()
-                # strip 'json' label
                 if s.lower().startswith("json"):
                     s = s[4:].strip()
         try:
