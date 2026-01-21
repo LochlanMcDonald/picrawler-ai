@@ -5,7 +5,7 @@ import logging
 import time
 from collections import deque
 from pathlib import Path
-from typing import Deque, List, Optional, Tuple, Union
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 from ai.vision_ai import AIVisionSystem
 from core.robot_controller import RobotController
@@ -49,36 +49,43 @@ class BaseBehavior:
         self._narration_min_interval_s = float(vs.get("narration_min_interval_s", 4.0))
         self._last_narration_at = 0.0
 
-        # --- AI Dialogue settings ---
+        # AI Dialogue settings
         self._dialogue_enabled = bool(vs.get("enabled", True)) and bool(vs.get("dialogue_enabled", True))
         self._dialogue_min_interval_s = float(vs.get("dialogue_min_interval_s", 10.0))
         self._last_dialogue_at = 0.0
         self._last_dialogue_text: Optional[str] = None
         self._dialogue_dedupe_window_s = float(vs.get("dialogue_dedupe_window_s", 30.0))
         self._last_dialogue_text_at = 0.0
-        # ----------------------------
 
-        # --- Curiosity / anti-loop state ---
+        # --- Behavior / anti-loop settings ---
         bl = (config.get("behavior_settings") or {}) if isinstance(config, dict) else {}
+
+        # Action-loop tracking
         self._recent_actions: Deque[str] = deque(maxlen=int(bl.get("anti_loop_history", 8)))
         self._repeat_threshold = int(bl.get("anti_loop_repeat_threshold", 3))
         self._oscillation_window = int(bl.get("anti_loop_oscillation_window", 4))
 
-        # Escape ladder (action, duration_override)
+        # Scene stagnation tracking (prevents "turn_right forever" in same view)
+        self._recent_scene_sigs: Deque[str] = deque(maxlen=int(bl.get("scene_history", 10)))
+        self._scene_repeat_threshold = int(bl.get("scene_repeat_threshold", 4))
+
+        # Short “ban” on actions that keep failing (prevents immediate re-pick)
+        self._banned_until: Dict[str, float] = {}
+        self._ban_seconds = float(bl.get("ban_seconds", 8.0))
+
+        # Escape ladder: heavier “get unstuck”
         self._escape_plan: List[Tuple[str, float]] = [
-            ("stop", float(bl.get("escape_stop_s", 0.3))),
-            ("backward", float(bl.get("escape_back_s", 0.9))),
-            ("turn_left", float(bl.get("escape_turn_s", 0.9))),  # may swap to right dynamically
-            ("forward", float(bl.get("escape_forward_s", 1.1))),
+            ("stop", float(bl.get("escape_stop_s", 0.25))),
+            ("backward", float(bl.get("escape_back_s", 1.25))),
+            ("turn_left", float(bl.get("escape_turn_s", 1.10))),  # direction may flip dynamically
+            ("forward", float(bl.get("escape_forward_s", 1.35))),
         ]
         self._escape_stage = 0
         self._last_escape_at = 0.0
         self._escape_cooldown_s = float(bl.get("escape_cooldown_s", 3.0))
 
-        # If we keep triggering escapes rapidly, increase severity.
         self._escape_strikes = 0
         self._max_strikes_before_reset = int(bl.get("escape_strikes_reset", 6))
-        # ----------------------------------
 
     # -----------------------------------------------------
 
@@ -89,43 +96,28 @@ class BaseBehavior:
         return f"mode={self.name} target={self.target}".strip()
 
     # -----------------------------------------------------
-    # 🧠 Anti-loop / curiosity logic
+    # Anti-loop helpers
     # -----------------------------------------------------
 
-    def postprocess_action(self, action: str) -> ActionChoice:
+    def _scene_signature(self, analysis) -> str:
         """
-        Bias actions to avoid getting stuck in loops.
-        Returns either:
-          - "action"
-          - ("action", duration_override_s)
-
-        Never overrides 'stop' (unless it's part of the escape ladder we choose).
+        Create a lightweight “same scene” signature.
+        If this repeats, we’re not making progress.
         """
-        # Always record what the model *wanted* to do.
-        if action:
-            self._recent_actions.append(action)
+        desc = (getattr(analysis, "description", "") or "").strip().lower()
+        hazards = getattr(analysis, "hazards", []) or []
+        objs = getattr(analysis, "objects", []) or []
 
-        # If model wants stop, honor it.
-        if action == "stop":
-            self._reset_escape_if_safe()
-            return action
+        # Keep it stable and short
+        h = ",".join(sorted([str(x).lower() for x in hazards])[:4])
+        o = ",".join(sorted([str(x).lower() for x in objs])[:4])
+        return f"{desc[:90]}|h:{h}|o:{o}"
 
-        # Not enough history yet.
-        if len(self._recent_actions) < self._repeat_threshold:
-            self._reset_escape_if_safe()
-            return action
-
-        # Detect same-action repetition (e.g., turn_right x3).
-        if self._is_repeating(action):
-            return self._escape(action, reason=f"repeat:{action}")
-
-        # Detect oscillation left-right-left-right.
-        if self._is_oscillating():
-            return self._escape(action, reason="oscillation")
-
-        # If no loop detected, slowly relax escape stage.
-        self._reset_escape_if_safe()
-        return action
+    def _is_scene_stagnant(self) -> bool:
+        if len(self._recent_scene_sigs) < self._scene_repeat_threshold:
+            return False
+        last = list(self._recent_scene_sigs)[-self._scene_repeat_threshold :]
+        return len(set(last)) == 1
 
     def _is_repeating(self, action: str) -> bool:
         last_actions = list(self._recent_actions)[-self._repeat_threshold :]
@@ -135,61 +127,121 @@ class BaseBehavior:
         if len(self._recent_actions) < self._oscillation_window:
             return False
         a, b, c, d = list(self._recent_actions)[-4:]
-        # basic ABAB pattern where A != B
-        return a == c and b == d and a != b
+        return a == c and b == d and a != b  # ABAB pattern
+
+    def _ban(self, action: str, seconds: Optional[float] = None) -> None:
+        self._banned_until[action] = time.time() + float(seconds if seconds is not None else self._ban_seconds)
+
+    def _is_banned(self, action: str) -> bool:
+        until = self._banned_until.get(action)
+        return bool(until and time.time() < until)
+
+    def _pick_non_banned_fallback(self, preferred: str) -> str:
+        """
+        Choose a safe alternative when the model picked a banned action.
+        """
+        order = {
+            "turn_right": ["backward", "turn_left", "forward", "stop"],
+            "turn_left": ["backward", "turn_right", "forward", "stop"],
+            "forward": ["backward", "turn_left", "turn_right", "stop"],
+            "backward": ["turn_left", "turn_right", "stop"],
+        }
+        for a in order.get(preferred, ["stop"]):
+            if not self._is_banned(a):
+                return a
+        return "stop"
+
+    def postprocess_action(self, action: str, analysis=None) -> ActionChoice:
+        """
+        Returns either:
+          - "action"
+          - ("action", duration_override_s)
+        """
+        if action:
+            self._recent_actions.append(action)
+
+        # If banned, override immediately
+        if action and self._is_banned(action):
+            new_action = self._pick_non_banned_fallback(action)
+            self.logger.debug(f"Action '{action}' is banned; overriding -> '{new_action}'")
+            return (new_action, 1.0 if new_action in ("backward", "forward") else 0.9)
+
+        # Honor stop
+        if action == "stop":
+            self._reset_escape_if_safe()
+            return action
+
+        # Detect stagnation (same scene) if we have analysis
+        if analysis is not None:
+            self._recent_scene_sigs.append(self._scene_signature(analysis))
+            if self._is_scene_stagnant():
+                # Ban the current action direction briefly (esp. turning)
+                if action in ("turn_left", "turn_right"):
+                    self._ban(action)
+                return self._escape(action, reason="scene_stagnation")
+
+        # Not enough history yet
+        if len(self._recent_actions) < self._repeat_threshold:
+            self._reset_escape_if_safe()
+            return action
+
+        # Repeating action
+        if self._is_repeating(action):
+            if action in ("turn_left", "turn_right"):
+                self._ban(action)
+            return self._escape(action, reason=f"repeat:{action}")
+
+        # Oscillation
+        if self._is_oscillating():
+            # ban both turns briefly to force backing out + forward
+            self._ban("turn_left")
+            self._ban("turn_right")
+            return self._escape(action, reason="oscillation")
+
+        self._reset_escape_if_safe()
+        return action
 
     def _escape(self, stuck_action: str, *, reason: str) -> ActionChoice:
-        """
-        Execute an escape ladder to break out of loops.
-        We also dynamically pick turn direction opposite the stuck turn.
-        """
         now = time.time()
 
-        # Cooldown: if we just escaped, don't keep hammering changes every frame.
+        # Cooldown: don't trigger escapes every single loop tick
         if (now - self._last_escape_at) < self._escape_cooldown_s:
-            # During cooldown, prefer a gentle forward/back instead of endless turning.
+            # During cooldown, force a move that changes the scene
             if stuck_action in ("turn_left", "turn_right"):
-                return ("backward", self._escape_plan[1][1])
-            return ("forward", self._escape_plan[-1][1])
+                return ("backward", 1.2)
+            return ("forward", 1.2)
 
         self._last_escape_at = now
         self._escape_strikes += 1
         if self._escape_strikes >= self._max_strikes_before_reset:
-            # Hard reset so we don't spiral forever.
             self._escape_strikes = 0
             self._escape_stage = 0
 
-        # Decide which stage to use.
         stage = self._escape_stage % len(self._escape_plan)
         action, dur = self._escape_plan[stage]
 
-        # Dynamic “turn opposite” if we are stuck turning.
+        # Turn opposite if stuck turning
         if action in ("turn_left", "turn_right"):
             if stuck_action == "turn_right":
                 action = "turn_left"
             elif stuck_action == "turn_left":
                 action = "turn_right"
-            # If stuck in forward/backward loops, alternate turns by stage parity.
             else:
                 action = "turn_left" if (stage % 2 == 0) else "turn_right"
 
-        # Escalate for next time.
         self._escape_stage += 1
 
-        # Clear recent action history so we don't re-trigger immediately.
+        # Clear histories so we don’t re-trigger instantly
         self._recent_actions.clear()
         self._recent_actions.append(action)
+        self._recent_scene_sigs.clear()
 
-        # Speak once per escape event (short).
-        self.logger.debug(f"Anti-loop escape triggered ({reason}) -> {action} ({dur:.2f}s)")
-        self._narrate("I’m stuck—breaking the loop.", level="normal")
+        self.logger.debug(f"Anti-loop escape ({reason}) -> {action} ({dur:.2f}s)")
+        self._narrate("I’m stuck—backing out and trying a new angle.", level="normal")
 
         return (action, dur)
 
     def _reset_escape_if_safe(self) -> None:
-        """
-        If we're not looping, gently decay escape stage/strikes over time.
-        """
         now = time.time()
         if (now - self._last_escape_at) > (self._escape_cooldown_s * 2):
             if self._escape_stage > 0:
@@ -211,18 +263,12 @@ class BaseBehavior:
         self._last_narration_at = now
 
     def _speak_dialogue(self, analysis, decision: dict, executed_action: str) -> None:
-        """
-        AI-generated dialogue (short, personality-driven).
-        Throttled + deduped. Safe: non-fatal if unavailable.
-        """
         if not self._dialogue_enabled:
             return
 
         now = time.time()
         if (now - self._last_dialogue_at) < self._dialogue_min_interval_s:
             return
-
-        # Only attempt if the AI system exposes the method (ai/vision_ai.py)
         if not hasattr(self.ai, "generate_dialogue"):
             return
 
@@ -249,10 +295,9 @@ class BaseBehavior:
             self._last_dialogue_at = now
             self._last_dialogue_text = line
             self._last_dialogue_text_at = now
-
         except Exception as e:
             self.logger.debug(f"Dialogue generation failed (non-fatal): {e}")
-            self._last_dialogue_at = now  # prevent hammering on repeated failures
+            self._last_dialogue_at = now
 
     # -----------------------------------------------------
 
@@ -260,7 +305,6 @@ class BaseBehavior:
         end_t = time.time() + (self.duration_minutes * 60)
         self.logger.info(f"Starting behavior '{self.name}' for {self.duration_minutes} min")
 
-        # Narrate start
         start_line = f"Starting {self.name} mode."
         if self.target:
             start_line = f"Starting {self.name} mode. Target: {self.target}."
@@ -301,7 +345,7 @@ class BaseBehavior:
             raw_action = decision.get("action", "stop")
             raw_duration_s = float(decision.get("duration_s", 0.6))
 
-            choice = self.postprocess_action(raw_action)
+            choice = self.postprocess_action(raw_action, analysis=analysis)
             if isinstance(choice, tuple):
                 action, duration_s = choice
             else:
@@ -322,6 +366,7 @@ class BaseBehavior:
                 "decision": decision,
                 "executed_action": action,
                 "executed_duration_s": duration_s,
+                "banned": {k: round(v - time.time(), 2) for k, v in self._banned_until.items() if v > time.time()},
             }
             if bool(self.config.get("logging_settings", {}).get("save_decisions", True)):
                 self.decisions_path.parent.mkdir(parents=True, exist_ok=True)
@@ -333,7 +378,7 @@ class BaseBehavior:
                 self.logger.info(f"Decision: {decision}")
                 self.logger.info(f"Executing: {action} ({duration_s:.2f}s)")
 
-            # Simple narration (short)
+            # Short narration
             if action == "forward":
                 self._narrate("Moving forward.", level="normal")
             elif action == "turn_left":
@@ -345,7 +390,6 @@ class BaseBehavior:
             elif action == "stop":
                 self._narrate("Stopping.", level="normal")
 
-            # AI-generated dialogue line (throttled)
             self._speak_dialogue(analysis, decision, action)
 
             self.robot.execute(action, duration_s)
