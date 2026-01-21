@@ -37,7 +37,7 @@ class ExplorationBehavior(BaseBehavior):
 
         # Small extra bias: if we detect immediate L<->R oscillation, try forward once.
         opposite = {"turn_left": "turn_right", "turn_right": "turn_left"}
-        if self._last_action and opposite.get(self._last_action) == base_action:
+        if self._last_action and opposite.get(self._last_action, None) == base_action:
             biased = "forward"
             self._last_action = biased
             # keep duration override if one existed (otherwise let caller use model duration)

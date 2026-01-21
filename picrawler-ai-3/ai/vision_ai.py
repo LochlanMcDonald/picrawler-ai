@@ -1,12 +1,14 @@
 """OpenAI vision + decision helper.
 
-Uses the OpenAI Responses API (text + image inputs).
+Uses the OpenAI Chat Completions API with vision support.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -30,6 +32,14 @@ class AIVisionSystem:
     # Default throttle (seconds); can be overridden via config or main.py
     MIN_SECONDS_BETWEEN_CALLS: float = 3.0
 
+    # Duration constraints for action decisions
+    MIN_ACTION_DURATION_S: float = 0.2
+    MAX_ACTION_DURATION_S: float = 3.0
+
+    # Token limits for decision API
+    MAX_DECISION_TOKENS: int = 500
+    MAX_DIALOGUE_TOKENS: int = 80
+
     def __init__(self, config: dict):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.config = config  # keep for dialogue/personality access
@@ -39,7 +49,7 @@ class AIVisionSystem:
         self.client = OpenAI(api_key=None if (api_key in (None, "", "your-api-key-here")) else api_key)
 
         ai = config.get("ai_settings", {})
-        self.model = ai.get("model", "gpt-4.1-mini")
+        self.model = ai.get("model", "gpt-4o-mini")
         self.max_output_tokens = int(ai.get("max_output_tokens", 800))
         self.temperature = float(ai.get("temperature", 0.4))
         self.timeout_s = int(ai.get("request_timeout_s", 30))
@@ -68,6 +78,24 @@ class AIVisionSystem:
         # -----------------------------------------------
 
     # -----------------------------------------------------
+    # Input validation
+    # -----------------------------------------------------
+
+    def _validate_base64(self, data: str) -> bool:
+        """Validate that data is properly formatted base64."""
+        if not data or not isinstance(data, str):
+            return False
+        # Check for valid base64 characters (alphanumeric + / + = padding)
+        if not re.match(r'^[A-Za-z0-9+/]*={0,2}$', data):
+            return False
+        # Try to decode to verify it's valid
+        try:
+            base64.b64decode(data, validate=True)
+            return True
+        except Exception:
+            return False
+
+    # -----------------------------------------------------
 
     def _speak_ai_failure_once(self, line: str) -> None:
         """Speak an AI-failure line, but suppress repeats for a cooldown window."""
@@ -90,6 +118,18 @@ class AIVisionSystem:
         Throttles calls to the OpenAI API and reuses the last analysis if called too soon.
         Falls back safely on API failure.
         """
+        # Validate base64 input
+        if not self._validate_base64(image_base64):
+            self.logger.error("Invalid base64 image data provided")
+            return SceneAnalysis(
+                description="Invalid input",
+                objects=[],
+                hazards=[],
+                suggested_actions=["stop"],
+                raw="Invalid base64 data",
+                processing_time_s=0.0,
+            )
+
         now = time.time()
         elapsed = now - self._last_call_time
 
@@ -109,25 +149,25 @@ class AIVisionSystem:
 
         t0 = time.time()
         try:
-            resp = self.client.responses.create(
+            resp = self.client.chat.completions.create(
                 model=self.model,
-                max_output_tokens=self.max_output_tokens,
+                max_tokens=self.max_output_tokens,
                 temperature=self.temperature,
-                input=[
+                messages=[
                     {
                         "role": "user",
                         "content": [
-                            {"type": "input_text", "text": prompt},
+                            {"type": "text", "text": prompt},
                             {
-                                "type": "input_image",
-                                "image_url": f"data:image/jpeg;base64,{image_base64}",
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
                             },
                         ],
                     }
                 ],
                 timeout=self.timeout_s,
             )
-            text = getattr(resp, "output_text", "") or ""
+            text = resp.choices[0].message.content or ""
 
         except (RateLimitError, APITimeoutError, APIError) as e:
             self.logger.error(f"OpenAI API failure: {e}")
@@ -140,8 +180,9 @@ class AIVisionSystem:
                 raw=str(e),
                 processing_time_s=time.time() - t0,
             )
+            # Update call time but DON'T cache failure - let it retry on next call
             self._last_call_time = now
-            self._last_analysis = analysis
+            # Don't update _last_analysis so we won't reuse this failure
             return analysis
 
         except Exception as e:
@@ -155,8 +196,9 @@ class AIVisionSystem:
                 raw=str(e),
                 processing_time_s=time.time() - t0,
             )
+            # Update call time but DON'T cache failure - let it retry on next call
             self._last_call_time = now
-            self._last_analysis = analysis
+            # Don't update _last_analysis so we won't reuse this failure
             return analysis
 
         dt = time.time() - t0
@@ -208,14 +250,14 @@ class AIVisionSystem:
 
         t0 = time.time()
         try:
-            resp = self.client.responses.create(
+            resp = self.client.chat.completions.create(
                 model=self.model,
-                max_output_tokens=min(self.max_output_tokens, 500),
+                max_tokens=min(self.max_output_tokens, self.MAX_DECISION_TOKENS),
                 temperature=self.temperature,
-                input=[{"role": "user", "content": [{"type": "input_text", "text": json.dumps(prompt)}]}],
+                messages=[{"role": "user", "content": json.dumps(prompt)}],
                 timeout=self.timeout_s,
             )
-            text = getattr(resp, "output_text", "") or ""
+            text = resp.choices[0].message.content or ""
         except Exception as e:
             self.logger.error(f"Decision API error: {e}")
             self._speak_ai_failure_once("Decision system is unstable. Stopping.")
@@ -237,7 +279,7 @@ class AIVisionSystem:
 
         return {
             "action": action,
-            "duration_s": max(0.2, min(duration_s, 3.0)),
+            "duration_s": max(self.MIN_ACTION_DURATION_S, min(duration_s, self.MAX_ACTION_DURATION_S)),
             "reasoning": str(data.get("reasoning", "")),
             "_latency_s": dt,
         }
@@ -326,21 +368,28 @@ class AIVisionSystem:
 
         t0 = time.time()
         try:
-            resp = self.client.responses.create(
+            # Use lower temperature (max 0.6) for more predictable dialogue generation
+            dialogue_temp = min(self.temperature, 0.6)
+            resp = self.client.chat.completions.create(
                 model=self.model,
-                max_output_tokens=80,
-                temperature=min(self.temperature, 0.6),
-                input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+                max_tokens=self.MAX_DIALOGUE_TOKENS,
+                temperature=dialogue_temp,
+                messages=[{"role": "user", "content": prompt}],
                 timeout=self.timeout_s,
             )
-            text = (getattr(resp, "output_text", "") or "").strip()
-        except (RateLimitError, APITimeoutError, APIError) as e:
-            self.logger.debug(f"Dialogue API failure (non-fatal): {e}")
+            text = (resp.choices[0].message.content or "").strip()
+        except RateLimitError as e:
+            # Rate limit: update throttle to prevent immediate retry
+            self.logger.debug(f"Dialogue rate limited (non-fatal): {e}")
             self._last_dialogue_at = now
             return ""
+        except (APITimeoutError, APIError) as e:
+            # Transient errors: don't update throttle, allow retry on next call
+            self.logger.debug(f"Dialogue API failure (non-fatal, will retry): {e}")
+            return ""
         except Exception as e:
-            self.logger.debug(f"Dialogue error (non-fatal): {e}")
-            self._last_dialogue_at = now
+            # Unexpected errors: log but don't throttle
+            self.logger.debug(f"Dialogue error (non-fatal, will retry): {e}")
             return ""
 
         # Clean up: keep first line, strip quotes, enforce length
@@ -349,10 +398,18 @@ class AIVisionSystem:
             self._last_dialogue_at = now
             return ""
 
-        # Enforce word cap (hard)
+        # Enforce word cap (smart truncation)
         words = line.split()
         if len(words) > max_words:
-            line = " ".join(words[:max_words]).rstrip(" ,.;:") + "."
+            # Try to find a natural sentence break within the limit
+            truncated = " ".join(words[:max_words])
+            # If truncated text ends with punctuation, use it
+            if truncated and truncated[-1] in ".!?":
+                line = truncated
+            else:
+                # Otherwise add period for clean speech
+                line = truncated.rstrip(" ,.;:") + "."
+            self.logger.debug(f"Dialogue truncated from {len(words)} to {max_words} words")
 
         # Dedupe exact repeats
         if self._last_dialogue_text == line and (now - self._last_dialogue_text_at) < dedupe_window_s:

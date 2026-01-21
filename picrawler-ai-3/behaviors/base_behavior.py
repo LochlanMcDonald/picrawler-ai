@@ -7,13 +7,18 @@ from collections import deque
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple, Union
 
-from ai.vision_ai import AIVisionSystem
+from ai.vision_ai import AIVisionSystem, SceneAnalysis
 from core.robot_controller import RobotController
 from vision.camera import CameraSystem
 from voice.voice_system import VoiceSystem
 
 
 ActionChoice = Union[str, Tuple[str, float]]  # ("action", duration_override_s)
+
+# Constants for action duration overrides
+BACKWARD_FORWARD_DURATION_S: float = 1.0
+TURN_DURATION_S: float = 0.9
+ESCAPE_COOLDOWN_DURATION_S: float = 1.2
 
 
 class BaseBehavior:
@@ -38,7 +43,11 @@ class BaseBehavior:
         self.verbose = verbose
 
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.decisions_path = Path("logs") / "decisions.jsonl"
+        # Validate and sanitize decisions path from config
+        log_dir = config.get("logging_settings", {}).get("log_dir", "logs") if isinstance(config, dict) else "logs"
+        # Ensure path doesn't escape current directory
+        safe_log_dir = str(Path(log_dir).resolve().relative_to(Path.cwd().resolve())) if ".." not in str(log_dir) else "logs"
+        self.decisions_path = Path(safe_log_dir) / "decisions.jsonl"
 
         # Voice system (safe: no-op if disabled)
         self.voice = VoiceSystem(config)
@@ -153,7 +162,7 @@ class BaseBehavior:
         return "stop"
 
     # IMPORTANT: keyword-only analysis to avoid subclass signature crashes
-    def postprocess_action(self, action: str, *, analysis=None, **_ignored) -> ActionChoice:
+    def postprocess_action(self, action: str, *, analysis: Optional[SceneAnalysis] = None, **_ignored) -> ActionChoice:
         """
         Returns either:
           - "action"
@@ -169,7 +178,8 @@ class BaseBehavior:
         if action and self._is_banned(action):
             new_action = self._pick_non_banned_fallback(action)
             self.logger.debug(f"Action '{action}' is banned; overriding -> '{new_action}'")
-            return (new_action, 1.0 if new_action in ("backward", "forward") else 0.9)
+            duration = BACKWARD_FORWARD_DURATION_S if new_action in ("backward", "forward") else TURN_DURATION_S
+            return (new_action, duration)
 
         # Honor stop
         if action == "stop":
@@ -211,9 +221,9 @@ class BaseBehavior:
         # Cooldown: don't trigger escapes every single loop tick
         if (now - self._last_escape_at) < self._escape_cooldown_s:
             # During cooldown, force a move that changes the scene
-            if stuck_action in ("turn_left", "turn_right"):
-                return ("backward", 1.2)
-            return ("forward", 1.2)
+            cooldown_action = "backward" if stuck_action in ("turn_left", "turn_right") else "forward"
+            self._recent_actions.append(cooldown_action)
+            return (cooldown_action, ESCAPE_COOLDOWN_DURATION_S)
 
         self._last_escape_at = now
         self._escape_strikes += 1
@@ -235,13 +245,14 @@ class BaseBehavior:
 
         self._escape_stage += 1
 
-        # Clear histories so we don’t re-trigger instantly
-        self._recent_actions.clear()
+        # Keep only the escape action in history to prevent immediate re-triggering
+        # but preserve enough context to detect new patterns
         self._recent_actions.append(action)
+        # Clear scene signatures since we're forcing a scene change
         self._recent_scene_sigs.clear()
 
         self.logger.debug(f"Anti-loop escape ({reason}) -> {action} ({dur:.2f}s)")
-        self._narrate("I’m stuck—backing out and trying a new angle.", level="normal")
+        self._narrate("I'm stuck—backing out and trying a new angle.", level="normal")
 
         return (action, dur)
 
@@ -271,13 +282,19 @@ class BaseBehavior:
             return
 
         now = time.time()
+        # Check throttle before generating (prevent race condition)
         if (now - self._last_dialogue_at) < self._dialogue_min_interval_s:
             return
-        if not hasattr(self.ai, "generate_dialogue"):
+
+        # Check if AI system has dialogue capability
+        if not callable(getattr(self.ai, "generate_dialogue", None)):
             return
 
+        # Update timestamp immediately to prevent concurrent calls
+        self._last_dialogue_at = now
+
         try:
-            line = self.ai.generate_dialogue(  # type: ignore[attr-defined]
+            line = self.ai.generate_dialogue(
                 mode=self.name,
                 target=self.target,
                 analysis=analysis,
@@ -288,6 +305,7 @@ class BaseBehavior:
             if not line:
                 return
 
+            # Check for exact duplicate
             if (
                 self._last_dialogue_text == line
                 and (now - self._last_dialogue_text_at) < self._dialogue_dedupe_window_s
@@ -296,16 +314,114 @@ class BaseBehavior:
 
             self.voice.say(line, level="normal", force=False)
 
-            self._last_dialogue_at = now
             self._last_dialogue_text = line
             self._last_dialogue_text_at = now
         except Exception as e:
             self.logger.debug(f"Dialogue generation failed (non-fatal): {e}")
-            self._last_dialogue_at = now
+
+    # -----------------------------------------------------
+    # Action narration mapping
+    # -----------------------------------------------------
+
+    ACTION_NARRATIONS = {
+        "forward": "Moving forward.",
+        "turn_left": "Turning left.",
+        "turn_right": "Turning right.",
+        "backward": "Backing up.",
+        "stop": "Stopping.",
+    }
+
+    def _narrate_action(self, action: str) -> None:
+        """Narrate the action being taken."""
+        narration = self.ACTION_NARRATIONS.get(action, "Acting.")
+        self._narrate(narration, level="normal")
+
+    def _process_frame(self) -> Optional[Tuple[SceneAnalysis, str, Optional[str]]]:
+        """
+        Capture frame and analyze scene.
+        Returns (analysis, b64, image_path) or None if capture failed.
+        """
+        pil, b64, path = self.camera.capture(
+            save=bool(self.config.get("logging_settings", {}).get("save_images", True))
+        )
+        if b64 is None:
+            self.logger.warning("No camera frame; stopping")
+            self._narrate("Stopping.", level="normal")
+            self.robot.execute("stop", 0.3)
+            time.sleep(0.5)
+            return None
+
+        analysis = self.ai.analyze_scene(b64, context=self.context())
+
+        if getattr(analysis, "description", "") in {"AI unavailable", "AI error"}:
+            self._narrate("I can't reach my AI right now. Stopping.", level="normal", force=True)
+
+        return (analysis, b64, path)
+
+    def _make_decision(self, analysis: SceneAnalysis) -> Tuple[str, float]:
+        """
+        Make action decision based on analysis.
+        Returns (action, duration_s).
+        """
+        decision = self.ai.decide_action(
+            analysis=analysis,
+            mode=self.name,
+            available_actions=self.available_actions(),
+            target=self.target,
+        )
+
+        raw_action = decision.get("action", "stop")
+        raw_duration_s = float(decision.get("duration_s", 0.6))
+
+        # Apply anti-loop postprocessing
+        choice = self.postprocess_action(raw_action, analysis=analysis)
+        if isinstance(choice, tuple):
+            action, duration_s = choice
+        else:
+            action, duration_s = choice, raw_duration_s
+
+        return action, duration_s, decision
+
+    def _log_decision(
+        self,
+        analysis: SceneAnalysis,
+        decision: Dict[str, Any],
+        action: str,
+        duration_s: float,
+        image_path: Optional[str],
+    ) -> None:
+        """Log decision to file."""
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "mode": self.name,
+            "target": self.target,
+            "image_path": image_path,
+            "analysis": {
+                "description": getattr(analysis, "description", ""),
+                "objects": getattr(analysis, "objects", []),
+                "hazards": getattr(analysis, "hazards", []),
+                "suggested_actions": getattr(analysis, "suggested_actions", []),
+                "processing_time_s": getattr(analysis, "processing_time_s", 0.0),
+            },
+            "decision": decision,
+            "executed_action": action,
+            "executed_duration_s": duration_s,
+            "banned": {k: round(v - time.time(), 2) for k, v in self._banned_until.items() if v > time.time()},
+        }
+        if bool(self.config.get("logging_settings", {}).get("save_decisions", True)):
+            self.decisions_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.decisions_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+
+        if self.verbose:
+            self.logger.info(f"Seen: {getattr(analysis, 'description', '')}")
+            self.logger.info(f"Decision: {decision}")
+            self.logger.info(f"Executing: {action} ({duration_s:.2f}s)")
 
     # -----------------------------------------------------
 
     def run(self) -> None:
+        """Main behavior loop."""
         end_t = time.time() + (self.duration_minutes * 60)
         self.logger.info(f"Starting behavior '{self.name}' for {self.duration_minutes} min")
 
@@ -324,79 +440,24 @@ class BaseBehavior:
                 continue
 
             last_capture = now
-            pil, b64, path = self.camera.capture(
-                save=bool(self.config.get("logging_settings", {}).get("save_images", True))
-            )
-            if b64 is None:
-                self.logger.warning("No camera frame; stopping")
-                self._narrate("Stopping.", level="normal")
-                self.robot.execute("stop", 0.3)
-                time.sleep(0.5)
+
+            # Capture and analyze frame
+            frame_result = self._process_frame()
+            if frame_result is None:
                 continue
+            analysis, b64, image_path = frame_result
 
-            analysis = self.ai.analyze_scene(b64, context=self.context())
+            # Make decision and apply anti-loop logic
+            action, duration_s, decision = self._make_decision(analysis)
 
-            if getattr(analysis, "description", "") in {"AI unavailable", "AI error"}:
-                self._narrate("I can't reach my AI right now. Stopping.", level="normal", force=True)
+            # Log decision
+            self._log_decision(analysis, decision, action, duration_s, image_path)
 
-            decision = self.ai.decide_action(
-                analysis=analysis,
-                mode=self.name,
-                available_actions=self.available_actions(),
-                target=self.target,
-            )
-
-            raw_action = decision.get("action", "stop")
-            raw_duration_s = float(decision.get("duration_s", 0.6))
-
-            # NOTE: keyword-only analysis, safe for subclasses
-            choice = self.postprocess_action(raw_action, analysis=analysis)
-            if isinstance(choice, tuple):
-                action, duration_s = choice
-            else:
-                action, duration_s = choice, raw_duration_s
-
-            record = {
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "mode": self.name,
-                "target": self.target,
-                "image_path": path,
-                "analysis": {
-                    "description": getattr(analysis, "description", ""),
-                    "objects": getattr(analysis, "objects", []),
-                    "hazards": getattr(analysis, "hazards", []),
-                    "suggested_actions": getattr(analysis, "suggested_actions", []),
-                    "processing_time_s": getattr(analysis, "processing_time_s", 0.0),
-                },
-                "decision": decision,
-                "executed_action": action,
-                "executed_duration_s": duration_s,
-                "banned": {k: round(v - time.time(), 2) for k, v in self._banned_until.items() if v > time.time()},
-            }
-            if bool(self.config.get("logging_settings", {}).get("save_decisions", True)):
-                self.decisions_path.parent.mkdir(parents=True, exist_ok=True)
-                with self.decisions_path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(record) + "\n")
-
-            if self.verbose:
-                self.logger.info(f"Seen: {getattr(analysis, 'description', '')}")
-                self.logger.info(f"Decision: {decision}")
-                self.logger.info(f"Executing: {action} ({duration_s:.2f}s)")
-
-            # Short narration
-            if action == "forward":
-                self._narrate("Moving forward.", level="normal")
-            elif action == "turn_left":
-                self._narrate("Turning left.", level="normal")
-            elif action == "turn_right":
-                self._narrate("Turning right.", level="normal")
-            elif action == "backward":
-                self._narrate("Backing up.", level="normal")
-            elif action == "stop":
-                self._narrate("Stopping.", level="normal")
-
+            # Narrate and speak
+            self._narrate_action(action)
             self._speak_dialogue(analysis, decision, action)
 
+            # Execute action
             self.robot.execute(action, duration_s)
 
         self.logger.info(f"Behavior '{self.name}' complete")
