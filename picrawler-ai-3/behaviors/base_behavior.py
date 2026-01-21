@@ -58,7 +58,9 @@ class BaseBehavior:
         self._last_dialogue_text_at = 0.0
 
         # --- Behavior / anti-loop settings ---
-        bl = (config.get("behavior_settings") or {}) if isinstance(config, dict) else {}
+        bs = (config.get("behavior_settings") or {}) if isinstance(config, dict) else {}
+        # Support either behavior_settings.anti_loop.* OR top-level keys under behavior_settings.*
+        bl = bs.get("anti_loop", bs) if isinstance(bs, dict) else {}
 
         # Action-loop tracking
         self._recent_actions: Deque[str] = deque(maxlen=int(bl.get("anti_loop_history", 8)))
@@ -73,7 +75,7 @@ class BaseBehavior:
         self._banned_until: Dict[str, float] = {}
         self._ban_seconds = float(bl.get("ban_seconds", 8.0))
 
-        # Escape ladder: heavier “get unstuck”
+        # Escape ladder (escalates)
         self._escape_plan: List[Tuple[str, float]] = [
             ("stop", float(bl.get("escape_stop_s", 0.25))),
             ("backward", float(bl.get("escape_back_s", 1.25))),
@@ -108,7 +110,6 @@ class BaseBehavior:
         hazards = getattr(analysis, "hazards", []) or []
         objs = getattr(analysis, "objects", []) or []
 
-        # Keep it stable and short
         h = ",".join(sorted([str(x).lower() for x in hazards])[:4])
         o = ",".join(sorted([str(x).lower() for x in objs])[:4])
         return f"{desc[:90]}|h:{h}|o:{o}"
@@ -151,11 +152,15 @@ class BaseBehavior:
                 return a
         return "stop"
 
-    def postprocess_action(self, action: str, analysis=None) -> ActionChoice:
+    # IMPORTANT: keyword-only analysis to avoid subclass signature crashes
+    def postprocess_action(self, action: str, *, analysis=None, **_ignored) -> ActionChoice:
         """
         Returns either:
           - "action"
           - ("action", duration_override_s)
+
+        `analysis` is keyword-only so subclasses can ignore it safely.
+        `**_ignored` prevents crashes if callers add more keyword args later.
         """
         if action:
             self._recent_actions.append(action)
@@ -193,7 +198,6 @@ class BaseBehavior:
 
         # Oscillation
         if self._is_oscillating():
-            # ban both turns briefly to force backing out + forward
             self._ban("turn_left")
             self._ban("turn_right")
             return self._escape(action, reason="oscillation")
@@ -345,6 +349,7 @@ class BaseBehavior:
             raw_action = decision.get("action", "stop")
             raw_duration_s = float(decision.get("duration_s", 0.6))
 
+            # NOTE: keyword-only analysis, safe for subclasses
             choice = self.postprocess_action(raw_action, analysis=analysis)
             if isinstance(choice, tuple):
                 action, duration_s = choice
