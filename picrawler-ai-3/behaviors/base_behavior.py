@@ -200,12 +200,13 @@ class BaseBehavior:
                 # Track this executed action
                 self._recent_actions.append(new_action)
                 return (new_action, 0.8)  # Moderate turn duration
-
-        # Reset obstacle override counter if we're not being overridden
-        if action not in ("forward", "ahead"):
-            if self._consecutive_obstacle_overrides > 0:
-                self.logger.debug(f"Reset obstacle override counter (was {self._consecutive_obstacle_overrides})")
-            self._consecutive_obstacle_overrides = 0
+            else:
+                # Successfully moving forward without obstacle - reset counter
+                if self._consecutive_obstacle_overrides > 0:
+                    self.logger.info(
+                        f"Obstacle cleared! Resetting override counter (was {self._consecutive_obstacle_overrides})"
+                    )
+                    self._consecutive_obstacle_overrides = 0
 
         # Track the requested action for normal anti-loop detection
         if action:
