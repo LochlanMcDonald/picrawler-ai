@@ -96,6 +96,10 @@ class BaseBehavior:
         self._escape_strikes = 0
         self._max_strikes_before_reset = int(bl.get("escape_strikes_reset", 6))
 
+        # Track consecutive obstacle overrides to prevent stuck loops
+        self._consecutive_obstacle_overrides = 0
+        self._max_obstacle_overrides = int(bl.get("max_obstacle_overrides_before_escape", 3))
+
         # per-tick control note for thought narration
         self._last_control_note: str = ""
 
@@ -158,28 +162,54 @@ class BaseBehavior:
     def postprocess_action(self, action: str, *, analysis=None, **_ignored) -> ActionChoice:
         self._last_control_note = ""
 
-        if action:
-            self._recent_actions.append(action)
-
         # PRIORITY 1: Check ultrasonic sensor for obstacles (SAFETY OVERRIDE)
         if action in ("forward", "ahead"):
             obstacle_info = self.robot.get_obstacle_info()
             if obstacle_info["has_obstacle"]:
                 distance = obstacle_info["distance_cm"]
                 threshold = obstacle_info["threshold_cm"]
+
+                # Track consecutive overrides - if too many, we're stuck!
+                self._consecutive_obstacle_overrides += 1
+
                 self.logger.warning(
-                    f"ULTRASONIC OVERRIDE: Obstacle at {distance:.1f}cm < {threshold}cm - "
-                    "preventing forward, choosing turn instead"
+                    f"ULTRASONIC OVERRIDE #{self._consecutive_obstacle_overrides}: "
+                    f"Obstacle at {distance:.1f}cm < {threshold}cm - preventing forward"
                 )
+
+                # If we've overridden too many times, we're stuck in a loop!
+                if self._consecutive_obstacle_overrides >= self._max_obstacle_overrides:
+                    self.logger.error(
+                        f"Stuck in obstacle loop ({self._consecutive_obstacle_overrides} consecutive overrides) - "
+                        "triggering escape sequence and banning forward"
+                    )
+                    self._narrate("I'm stuck. Trying to escape.", level="normal", force=True)
+                    # Ban forward to force different behavior
+                    self._ban("forward")
+                    self._consecutive_obstacle_overrides = 0  # Reset counter
+                    self._last_control_note = f"obstacle loop -> escape"
+                    return self._escape(action, reason="obstacle_loop")
+
                 # Voice feedback
                 self._narrate(f"Obstacle detected. Turning.", level="normal")
 
                 # Choose turn direction pseudo-randomly to avoid getting stuck
                 import random
                 new_action = random.choice(["turn_left", "turn_right"])
-                self._last_control_note = f"obstacle {distance:.1f}cm -> {new_action}"
-                # Don't ban forward - we might be able to go forward later
+                self._last_control_note = f"obstacle {distance:.1f}cm ({self._consecutive_obstacle_overrides}) -> {new_action}"
+                # Track this executed action
+                self._recent_actions.append(new_action)
                 return (new_action, 0.8)  # Moderate turn duration
+
+        # Reset obstacle override counter if we're not being overridden
+        if action not in ("forward", "ahead"):
+            if self._consecutive_obstacle_overrides > 0:
+                self.logger.debug(f"Reset obstacle override counter (was {self._consecutive_obstacle_overrides})")
+            self._consecutive_obstacle_overrides = 0
+
+        # Track the requested action for normal anti-loop detection
+        if action:
+            self._recent_actions.append(action)
 
         # If banned, override immediately
         if action and self._is_banned(action):
@@ -436,11 +466,15 @@ class BaseBehavior:
             if getattr(analysis, "description", "") in {"AI unavailable", "AI error"}:
                 self._narrate("I can't reach my AI right now. Stopping.", level="normal", force=True)
 
+            # Get obstacle info for AI decision making
+            obstacle_info = self.robot.get_obstacle_info()
+
             decision = self.ai.decide_action(
                 analysis=analysis,
                 mode=self.name,
                 available_actions=self.available_actions(),
                 target=self.target,
+                obstacle_info=obstacle_info,
             )
 
             raw_action = str(decision.get("action", "stop"))
@@ -465,9 +499,7 @@ class BaseBehavior:
                 force=self._thoughts_force_each_tick,
             )
 
-            # Get obstacle info for logging
-            obstacle_info = self.robot.get_obstacle_info()
-
+            # Use same obstacle_info from decision making (no need to call twice)
             record = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "mode": self.name,

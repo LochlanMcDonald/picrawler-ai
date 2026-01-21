@@ -208,6 +208,7 @@ class AIVisionSystem:
         mode: str,
         available_actions: List[str],
         target: Optional[str] = None,
+        obstacle_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Ask the model to choose one action from available_actions."""
         prompt = {
@@ -226,6 +227,22 @@ class AIVisionSystem:
                 "If unsafe/uncertain, pick 'stop'."
             ),
         }
+
+        # Add ultrasonic sensor data if available
+        if obstacle_info and obstacle_info.get("sensor_available"):
+            distance = obstacle_info.get("distance_cm")
+            has_obstacle = obstacle_info.get("has_obstacle")
+            threshold = obstacle_info.get("threshold_cm")
+
+            prompt["ultrasonic_sensor"] = {
+                "distance_cm": distance,
+                "obstacle_detected": has_obstacle,
+                "threshold_cm": threshold,
+                "note": (
+                    f"Physical obstacle at {distance:.1f}cm (threshold: {threshold}cm). "
+                    "DO NOT choose 'forward' if obstacle_detected is true!"
+                ) if has_obstacle else f"Clear path ahead ({distance:.1f}cm)"
+            }
 
         t0 = time.time()
         try:
