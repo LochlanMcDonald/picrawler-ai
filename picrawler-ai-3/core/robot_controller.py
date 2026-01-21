@@ -41,28 +41,48 @@ class BaseRobot:
     def posture(self, name: str, speed: int) -> None:  # pragma: no cover
         raise NotImplementedError
 
+    def get_distance(self) -> Optional[float]:  # pragma: no cover
+        """Get distance reading from ultrasonic sensor in cm."""
+        return None  # Default: no sensor
+
 
 class MockRobot(BaseRobot):
     def __init__(self) -> None:
         self.logger = logging.getLogger(self.__class__.__name__)
+        self._mock_distance = 50.0  # Start with safe distance
 
     def forward(self, speed: int) -> None:
         self.logger.info(f"MOCK: forward speed={speed}")
+        # Simulate getting closer to obstacle when moving forward
+        if self._mock_distance > 10:
+            self._mock_distance -= 5
 
     def backward(self, speed: int) -> None:
         self.logger.info(f"MOCK: backward speed={speed}")
+        # Simulate moving away from obstacle
+        self._mock_distance = min(100, self._mock_distance + 5)
 
     def turn_left(self, speed: int) -> None:
         self.logger.info(f"MOCK: turn_left speed={speed}")
+        # Simulate different distance after turning
+        import random
+        self._mock_distance = random.uniform(20, 80)
 
     def turn_right(self, speed: int) -> None:
         self.logger.info(f"MOCK: turn_right speed={speed}")
+        # Simulate different distance after turning
+        import random
+        self._mock_distance = random.uniform(20, 80)
 
     def stop(self) -> None:
         self.logger.info("MOCK: stop")
 
     def posture(self, name: str, speed: int) -> None:
         self.logger.info(f"MOCK: posture {name} speed={speed}")
+
+    def get_distance(self) -> Optional[float]:
+        """Return mock distance reading."""
+        return self._mock_distance
 
 
 class SunFounderPiCrawlerRobot(BaseRobot):
@@ -82,6 +102,19 @@ class SunFounderPiCrawlerRobot(BaseRobot):
 
         self.logger = logging.getLogger(self.__class__.__name__)
         self.crawler = Picrawler()
+
+        # Try to access ultrasonic sensor if available
+        self.ultrasonic = None
+        try:
+            if hasattr(self.crawler, "ultrasonic"):
+                self.ultrasonic = self.crawler.ultrasonic
+                self.logger.info("Ultrasonic sensor available")
+            elif hasattr(self.crawler, "get_distance"):
+                # Some versions have direct distance method
+                self.ultrasonic = self.crawler
+                self.logger.info("Distance sensor available")
+        except Exception as e:
+            self.logger.debug(f"Ultrasonic sensor not available: {e}")
 
         # Safe default posture if available (log failures but continue)
         for pose in ("sit", "stand"):
@@ -190,6 +223,34 @@ class SunFounderPiCrawlerRobot(BaseRobot):
         # Postures are typically steps
         self._do(name, speed)
 
+    def get_distance(self) -> Optional[float]:
+        """Get distance reading from ultrasonic sensor in cm.
+
+        Returns None if sensor not available or reading fails.
+        """
+        if self.ultrasonic is None:
+            return None
+
+        try:
+            # Try common SunFounder API patterns
+            if hasattr(self.ultrasonic, "get_distance"):
+                distance = self.ultrasonic.get_distance()
+            elif hasattr(self.ultrasonic, "read"):
+                distance = self.ultrasonic.read()
+            elif callable(self.ultrasonic):
+                distance = self.ultrasonic()
+            else:
+                return None
+
+            # Validate reading (sensor sometimes returns -1 or very large values on error)
+            if distance is not None and 0 < distance < 400:  # 4 meters max
+                return float(distance)
+            return None
+
+        except Exception as e:
+            self.logger.debug(f"Distance sensor read failed: {e}")
+            return None
+
 
 class RobotController:
     """High-level control used by behaviors."""
@@ -209,9 +270,17 @@ class RobotController:
         self.move_speed = int(rs.get("movement_speed", 50))
         self.turn_speed = int(rs.get("turn_speed", 45))
         self.step_delay = float(rs.get("step_delay", 0.05))
+        self.obstacle_threshold_cm = float(rs.get("obstacle_distance_threshold_cm", 20.0))
         self.dry_run_if_no_hardware = bool(rs.get("dry_run_if_no_hardware", True))
 
         self.robot: BaseRobot = self._init_robot()
+
+        # Check if ultrasonic sensor is available
+        distance = self.robot.get_distance()
+        if distance is not None:
+            self.logger.info(f"Ultrasonic sensor initialized (current: {distance:.1f}cm, threshold: {self.obstacle_threshold_cm}cm)")
+        else:
+            self.logger.info("Ultrasonic sensor not available - using vision only")
 
     def _init_robot(self) -> BaseRobot:
         try:
@@ -224,6 +293,39 @@ class RobotController:
             self.logger.warning(f"Falling back to MockRobot (reason: {e})")
             return MockRobot()
 
+    def get_distance(self) -> Optional[float]:
+        """Get current distance reading from ultrasonic sensor.
+
+        Returns:
+            Distance in cm, or None if sensor not available
+        """
+        return self.robot.get_distance()
+
+    def has_obstacle(self) -> bool:
+        """Check if there's an obstacle within threshold distance.
+
+        Returns:
+            True if obstacle detected, False otherwise
+        """
+        distance = self.get_distance()
+        if distance is None:
+            return False
+        return distance < self.obstacle_threshold_cm
+
+    def get_obstacle_info(self) -> dict:
+        """Get obstacle detection info for logging/decision making.
+
+        Returns:
+            Dict with distance, has_obstacle, threshold
+        """
+        distance = self.get_distance()
+        return {
+            "distance_cm": distance,
+            "has_obstacle": distance is not None and distance < self.obstacle_threshold_cm,
+            "threshold_cm": self.obstacle_threshold_cm,
+            "sensor_available": distance is not None,
+        }
+
     def execute(self, action: str, duration_s: float = 0.6) -> None:
         """Execute a simple motion primitive."""
         action = action.lower().strip()
@@ -233,6 +335,16 @@ class RobotController:
         if not is_posture and action not in self.VALID_ACTIONS:
             self.logger.warning(f"Invalid action '{action}', defaulting to stop for safety")
             action = "stop"
+
+        # Check for obstacles before forward movement
+        if action in {"forward", "ahead"}:
+            if self.has_obstacle():
+                distance = self.get_distance()
+                self.logger.warning(
+                    f"Obstacle detected at {distance:.1f}cm (< {self.obstacle_threshold_cm}cm) - "
+                    "blocking forward movement"
+                )
+                action = "stop"
 
         self.logger.info(f"ACTION: {action} duration={duration_s}")
 

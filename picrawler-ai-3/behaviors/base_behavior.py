@@ -161,6 +161,26 @@ class BaseBehavior:
         if action:
             self._recent_actions.append(action)
 
+        # PRIORITY 1: Check ultrasonic sensor for obstacles (SAFETY OVERRIDE)
+        if action in ("forward", "ahead"):
+            obstacle_info = self.robot.get_obstacle_info()
+            if obstacle_info["has_obstacle"]:
+                distance = obstacle_info["distance_cm"]
+                threshold = obstacle_info["threshold_cm"]
+                self.logger.warning(
+                    f"ULTRASONIC OVERRIDE: Obstacle at {distance:.1f}cm < {threshold}cm - "
+                    "preventing forward, choosing turn instead"
+                )
+                # Voice feedback
+                self._narrate(f"Obstacle detected. Turning.", level="normal")
+
+                # Choose turn direction pseudo-randomly to avoid getting stuck
+                import random
+                new_action = random.choice(["turn_left", "turn_right"])
+                self._last_control_note = f"obstacle {distance:.1f}cm -> {new_action}"
+                # Don't ban forward - we might be able to go forward later
+                return (new_action, 0.8)  # Moderate turn duration
+
         # If banned, override immediately
         if action and self._is_banned(action):
             new_action = self._pick_non_banned_fallback(action)
@@ -445,6 +465,9 @@ class BaseBehavior:
                 force=self._thoughts_force_each_tick,
             )
 
+            # Get obstacle info for logging
+            obstacle_info = self.robot.get_obstacle_info()
+
             record = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "mode": self.name,
@@ -457,6 +480,7 @@ class BaseBehavior:
                     "suggested_actions": getattr(analysis, "suggested_actions", []),
                     "processing_time_s": getattr(analysis, "processing_time_s", 0.0),
                 },
+                "obstacle": obstacle_info,
                 "decision": decision,
                 "raw_action": raw_action,
                 "raw_duration_s": raw_duration_s,
@@ -472,6 +496,8 @@ class BaseBehavior:
 
             if self.verbose:
                 self.logger.info(f"Seen: {getattr(analysis, 'description', '')}")
+                if obstacle_info["sensor_available"]:
+                    self.logger.info(f"Obstacle: {obstacle_info['distance_cm']:.1f}cm (threshold: {obstacle_info['threshold_cm']}cm, detected: {obstacle_info['has_obstacle']})")
                 self.logger.info(f"Decision: {decision}")
                 self.logger.info(f"Executing: {action} ({duration_s:.2f}s) | note={self._last_control_note}")
 
