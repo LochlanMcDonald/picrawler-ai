@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from behaviors.base_behavior import BaseBehavior
+from typing import Optional
+
+from behaviors.base_behavior import BaseBehavior, ActionChoice
 
 
 class ExplorationBehavior(BaseBehavior):
@@ -8,34 +10,38 @@ class ExplorationBehavior(BaseBehavior):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._last_action: str | None = None
+        self._last_action: Optional[str] = None
 
     def context(self) -> str:
         return "Explore the area safely. Prefer forward motion when clear. Avoid obstacles."
 
-    def postprocess_action(self, action: str) -> str:
+    # IMPORTANT: match BaseBehavior signature (keyword-only analysis + **kwargs)
+    def postprocess_action(self, action: str, *, analysis=None, **kwargs) -> ActionChoice:
         """
-        Anti-loop / curiosity bias.
-
-        Prevents immediate oscillation like:
-          turn_left -> turn_right -> turn_left
-
-        If detected, bias toward forward motion instead.
+        Adds a small exploration-specific bias on top of BaseBehavior anti-loop logic.
         """
-        if self._last_action is None:
-            self._last_action = action
-            return action
+        # First let the BaseBehavior anti-loop system run (scene stagnation, bans, escape ladder, etc.)
+        choice = super().postprocess_action(action, analysis=analysis, **kwargs)
 
-        opposite = {
-            "turn_left": "turn_right",
-            "turn_right": "turn_left",
-        }
+        # Unpack choice to a plain action string so we can apply our bias safely,
+        # then re-pack if needed.
+        if isinstance(choice, tuple):
+            base_action, base_dur = choice
+        else:
+            base_action, base_dur = choice, None
 
-        if opposite.get(self._last_action) == action:
-            # Bias toward curiosity: try moving forward instead of oscillating
-            biased_action = "forward"
-            self._last_action = biased_action
-            return biased_action
+        # If base already decided to stop, don't fight it.
+        if base_action == "stop":
+            self._last_action = base_action
+            return choice
 
-        self._last_action = action
-        return action
+        # Small extra bias: if we detect immediate L<->R oscillation, try forward once.
+        opposite = {"turn_left": "turn_right", "turn_right": "turn_left"}
+        if self._last_action and opposite.get(self._last_action) == base_action:
+            biased = "forward"
+            self._last_action = biased
+            # keep duration override if one existed (otherwise let caller use model duration)
+            return (biased, base_dur) if base_dur is not None else biased
+
+        self._last_action = base_action
+        return choice
