@@ -530,9 +530,16 @@ class BaseBehavior:
             if self.verbose:
                 self.logger.info(f"Seen: {getattr(analysis, 'description', '')}")
                 if obstacle_info["sensor_available"]:
-                    self.logger.info(f"Obstacle: {obstacle_info['distance_cm']:.1f}cm (threshold: {obstacle_info['threshold_cm']}cm, detected: {obstacle_info['has_obstacle']})")
+                    self.logger.info(
+                        f"Obstacle: {obstacle_info['distance_cm']:.1f}cm "
+                        f"(threshold: {obstacle_info['threshold_cm']}cm, "
+                        f"detected: {obstacle_info['has_obstacle']}, "
+                        f"override_count: {self._consecutive_obstacle_overrides})"
+                    )
+                else:
+                    self.logger.info("Obstacle: Sensor not available (vision-only mode)")
                 self.logger.info(f"Decision: {decision}")
-                self.logger.info(f"Executing: {action} ({duration_s:.2f}s) | note={self._last_control_note}")
+                self.logger.info(f"Raw→Executed: {raw_action}→{action} ({duration_s:.2f}s) | note={self._last_control_note}")
 
             # Short narration (optional / still throttled)
             if action == "forward":
