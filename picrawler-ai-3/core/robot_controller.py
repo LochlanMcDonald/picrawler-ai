@@ -83,13 +83,14 @@ class SunFounderPiCrawlerRobot(BaseRobot):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.crawler = Picrawler()
 
-        # Safe default posture if available (ignore failures)
+        # Safe default posture if available (log failures but continue)
         for pose in ("sit", "stand"):
             try:
                 self.posture(pose, 60)
+                self.logger.info(f"Initialized with posture: {pose}")
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.debug(f"Posture '{pose}' not available: {e}")
 
     def _do(self, name: str, speed: int) -> None:
         """
@@ -139,9 +140,10 @@ class SunFounderPiCrawlerRobot(BaseRobot):
             try:
                 self._do(name, speed)
                 return
-            except Exception:
+            except Exception as e:
+                self.logger.debug(f"Action '{name}' not available: {e}")
                 continue
-        # last try:
+        # last try (will raise if not found):
         self._do("backward", speed)
 
     def turn_left(self, speed: int) -> None:
@@ -150,8 +152,10 @@ class SunFounderPiCrawlerRobot(BaseRobot):
             try:
                 self._do(name, speed)
                 return
-            except Exception:
+            except Exception as e:
+                self.logger.debug(f"Action '{name}' not available: {e}")
                 continue
+        # last try (will raise if not found):
         self._do("turn_left", speed)
 
     def turn_right(self, speed: int) -> None:
@@ -159,8 +163,10 @@ class SunFounderPiCrawlerRobot(BaseRobot):
             try:
                 self._do(name, speed)
                 return
-            except Exception:
+            except Exception as e:
+                self.logger.debug(f"Action '{name}' not available: {e}")
                 continue
+        # last try (will raise if not found):
         self._do("turn_right", speed)
 
     def stop(self) -> None:
@@ -169,15 +175,16 @@ class SunFounderPiCrawlerRobot(BaseRobot):
             try:
                 self._do(name, 0)
                 return
-            except Exception:
+            except Exception as e:
+                self.logger.debug(f"Action '{name}' not available: {e}")
                 continue
         # If stop isn't a known action, try direct attr without speed
         fn = getattr(self.crawler, "stop", None)
         if callable(fn):
             fn()
             return
-        # As a last resort, do nothing (better than crashing)
-        self.logger.warning("No stop() method or stop action available; ignoring.")
+        # As a last resort, log critical error (cannot stop robot!)
+        self.logger.error("CRITICAL: No stop() method or stop action available on hardware!")
 
     def posture(self, name: str, speed: int) -> None:
         # Postures are typically steps
@@ -186,6 +193,15 @@ class SunFounderPiCrawlerRobot(BaseRobot):
 
 class RobotController:
     """High-level control used by behaviors."""
+
+    # Valid action prefixes and keywords
+    VALID_ACTIONS = {
+        "forward", "ahead",
+        "back", "backward", "reverse",
+        "turn_left", "left",
+        "turn_right", "right",
+        "stop", "halt",
+    }
 
     def __init__(self, config: dict):
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -211,6 +227,13 @@ class RobotController:
     def execute(self, action: str, duration_s: float = 0.6) -> None:
         """Execute a simple motion primitive."""
         action = action.lower().strip()
+
+        # Validate action (posture: prefix is also valid)
+        is_posture = action.startswith("posture:")
+        if not is_posture and action not in self.VALID_ACTIONS:
+            self.logger.warning(f"Invalid action '{action}', defaulting to stop for safety")
+            action = "stop"
+
         self.logger.info(f"ACTION: {action} duration={duration_s}")
 
         if action in {"forward", "ahead"}:

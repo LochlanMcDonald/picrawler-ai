@@ -69,6 +69,23 @@ class AIVisionSystem:
 
     # -----------------------------------------------------
 
+    def _retry_api_call(self, func, max_retries: int = 2, delay_s: float = 1.0):
+        """Retry API call with exponential backoff for transient failures."""
+        for attempt in range(max_retries + 1):
+            try:
+                return func()
+            except (APITimeoutError, RateLimitError) as e:
+                if attempt < max_retries:
+                    self.logger.warning(f"API call failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                    time.sleep(delay_s * (2 ** attempt))  # Exponential backoff
+                else:
+                    raise  # Re-raise on final attempt
+            except Exception:
+                # Don't retry non-transient errors
+                raise
+
+    # -----------------------------------------------------
+
     def _speak_ai_failure_once(self, line: str) -> None:
         """Speak an AI-failure line, but suppress repeats for a cooldown window."""
         now = time.time()
@@ -109,24 +126,28 @@ class AIVisionSystem:
 
         t0 = time.time()
         try:
-            resp = self.client.responses.create(
-                model=self.model,
-                max_output_tokens=self.max_output_tokens,
-                temperature=self.temperature,
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": prompt},
-                            {
-                                "type": "input_image",
-                                "image_url": f"data:image/jpeg;base64,{image_base64}",
-                            },
-                        ],
-                    }
-                ],
-                timeout=self.timeout_s,
-            )
+            # Retry API call for transient failures
+            def api_call():
+                return self.client.responses.create(
+                    model=self.model,
+                    max_output_tokens=self.max_output_tokens,
+                    temperature=self.temperature,
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": prompt},
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:image/jpeg;base64,{image_base64}",
+                                },
+                            ],
+                        }
+                    ],
+                    timeout=self.timeout_s,
+                )
+
+            resp = self._retry_api_call(api_call, max_retries=2)
             text = getattr(resp, "output_text", "") or ""
 
         except (RateLimitError, APITimeoutError, APIError) as e:
@@ -208,13 +229,17 @@ class AIVisionSystem:
 
         t0 = time.time()
         try:
-            resp = self.client.responses.create(
-                model=self.model,
-                max_output_tokens=min(self.max_output_tokens, 500),
-                temperature=self.temperature,
-                input=[{"role": "user", "content": [{"type": "input_text", "text": json.dumps(prompt)}]}],
-                timeout=self.timeout_s,
-            )
+            # Retry API call for transient failures
+            def api_call():
+                return self.client.responses.create(
+                    model=self.model,
+                    max_output_tokens=min(self.max_output_tokens, 500),
+                    temperature=self.temperature,
+                    input=[{"role": "user", "content": [{"type": "input_text", "text": json.dumps(prompt)}]}],
+                    timeout=self.timeout_s,
+                )
+
+            resp = self._retry_api_call(api_call, max_retries=2)
             text = getattr(resp, "output_text", "") or ""
         except Exception as e:
             self.logger.error(f"Decision API error: {e}")
@@ -379,7 +404,16 @@ class AIVisionSystem:
                 if s.lower().startswith("json"):
                     s = s[4:].strip()
         try:
-            return json.loads(s)
-        except Exception:
-            self.logger.warning("Model output was not valid JSON; returning empty structure")
+            parsed = json.loads(s)
+            # Validate it's a dictionary (expected structure)
+            if not isinstance(parsed, dict):
+                self.logger.warning(f"JSON parsed but not a dict: {type(parsed)}")
+                return {"description": "", "objects": [], "hazards": [], "suggested_actions": []}
+            return parsed
+        except json.JSONDecodeError as e:
+            self.logger.warning(f"JSON decode error at position {e.pos}: {e.msg}")
+            self.logger.debug(f"Invalid JSON text: {text[:200]}")
+            return {"description": "", "objects": [], "hazards": [], "suggested_actions": []}
+        except Exception as e:
+            self.logger.warning(f"Unexpected error parsing JSON: {e}")
             return {"description": "", "objects": [], "hazards": [], "suggested_actions": []}

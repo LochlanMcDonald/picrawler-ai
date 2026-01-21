@@ -9,7 +9,7 @@ from typing import Deque, Dict, List, Optional, Tuple, Union
 
 from ai.vision_ai import AIVisionSystem
 from core.robot_controller import RobotController
-from vision.camera import CameraSystem
+from vision.camera import CameraSystem, CameraPanicException
 from voice.voice_system import VoiceSystem
 
 ActionChoice = Union[str, Tuple[str, float]]  # ("action", duration_override_s)
@@ -366,6 +366,10 @@ class BaseBehavior:
         capture_interval = float(self.config.get("camera_settings", {}).get("capture_interval_s", 2.5))
         last_capture = 0.0
 
+        # Circuit breaker for camera failures
+        consecutive_camera_failures = 0
+        max_consecutive_failures = 5
+
         while time.time() < end_t:
             now = time.time()
             if now - last_capture < capture_interval:
@@ -373,15 +377,38 @@ class BaseBehavior:
                 continue
 
             last_capture = now
-            _pil, b64, path = self.camera.capture(
-                save=bool(self.config.get("logging_settings", {}).get("save_images", True))
-            )
-            if b64 is None:
-                self.logger.warning("No camera frame; stopping")
-                self._narrate("Stopping.", level="normal")
-                self._think("No camera frame. Executing stop for safety.", force=True)
-                self.robot.execute("stop", 0.3)
-                time.sleep(0.5)
+
+            # Attempt camera capture with panic detection and circuit breaker
+            try:
+                _pil, b64, path = self.camera.capture(
+                    save=bool(self.config.get("logging_settings", {}).get("save_images", True))
+                )
+                if b64 is None:
+                    consecutive_camera_failures += 1
+                    self.logger.warning(f"No camera frame (failure {consecutive_camera_failures}/{max_consecutive_failures})")
+
+                    # Circuit breaker: stop if too many consecutive failures
+                    if consecutive_camera_failures >= max_consecutive_failures:
+                        self.logger.error("Camera circuit breaker triggered - too many consecutive failures")
+                        self._narrate("Camera system failure. Stopping.", level="normal", force=True)
+                        self.robot.execute("stop", 0.3)
+                        break
+
+                    self._narrate("Stopping.", level="normal")
+                    self._think("No camera frame. Executing stop for safety.", force=True)
+                    self.robot.execute("stop", 0.3)
+                    time.sleep(0.5)
+                    continue
+                else:
+                    # Reset failure counter on success
+                    consecutive_camera_failures = 0
+
+            except CameraPanicException as e:
+                # Panic detection triggered - emergency stop
+                self.logger.warning(f"Camera panic: {e}")
+                self.robot.execute("stop", 0.5)
+                # Wait longer before continuing after panic
+                time.sleep(2.0)
                 continue
 
             analysis = self.ai.analyze_scene(b64, context=self.context())

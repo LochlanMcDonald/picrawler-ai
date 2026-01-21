@@ -136,6 +136,16 @@ class VoiceSystem:
         key = self._hash_key(text)
         out = self.cache_dir / f"{key}.{self.settings.format}"
 
+        # Security: Validate path is within cache directory (prevent path traversal)
+        try:
+            resolved_out = out.resolve()
+            resolved_cache = self.cache_dir.resolve()
+            if not str(resolved_out).startswith(str(resolved_cache)):
+                raise ValueError(f"Invalid audio path: {out}")
+        except Exception as e:
+            self.logger.error(f"Path validation failed: {e}")
+            raise
+
         if out.exists() and out.stat().st_size > 0:
             return out
 
@@ -156,6 +166,18 @@ class VoiceSystem:
 
         if self._player[0] == "aplay" and audio_path.suffix.lower() != ".wav":
             raise RuntimeError("aplay requires wav output")
+
+        # Security: Validate path exists and is within cache directory
+        try:
+            resolved_path = audio_path.resolve()
+            resolved_cache = self.cache_dir.resolve()
+            if not str(resolved_path).startswith(str(resolved_cache)):
+                raise ValueError(f"Audio path outside cache directory: {audio_path}")
+            if not resolved_path.exists():
+                raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        except Exception as e:
+            self.logger.error(f"Audio path validation failed: {e}")
+            raise
 
         subprocess.run(
             [*self._player, str(audio_path)],

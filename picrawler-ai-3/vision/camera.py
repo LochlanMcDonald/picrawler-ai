@@ -22,6 +22,11 @@ from PIL import Image, ImageChops, ImageStat
 from voice.voice_system import VoiceSystem
 
 
+class CameraPanicException(Exception):
+    """Raised when sudden visual change is detected (safety mechanism)."""
+    pass
+
+
 class CameraSystem:
     def __init__(self, config: dict, save_dir: str = "logs/images"):
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -168,7 +173,7 @@ class CameraSystem:
 
         # --- PANIC DETECTION ---
         if self._detect_panic(img):
-            return None, None, None
+            raise CameraPanicException("Sudden visual change detected - emergency stop")
         # ----------------------
 
         # JPEG encode
