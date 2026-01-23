@@ -37,6 +37,9 @@ from planning.ai_planner import AIPlanner
 
 def setup_logging(log_level: str = "INFO") -> None:
     """Configure logging."""
+    # Ensure logs directory exists
+    Path('logs').mkdir(exist_ok=True)
+
     logging.basicConfig(
         level=getattr(logging, log_level.upper()),
         format='%(asctime)s | %(name)-20s | %(levelname)-7s | %(message)s',
