@@ -34,6 +34,7 @@ from planning.behavior_tree import (
     Status
 )
 from planning.ai_planner import AIPlanner
+from planning.language_controller import LanguageController
 
 
 def setup_logging(log_level: str = "INFO") -> None:
@@ -68,7 +69,8 @@ def load_config(config_path: str) -> dict:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PiCrawler-AI v4 - Robust Architecture")
-    p.add_argument("--mode", default="explore", choices=["explore", "cautious", "test"],
+    p.add_argument("--mode", default="explore",
+                  choices=["explore", "cautious", "test", "language", "interactive"],
                   help="Operation mode")
     p.add_argument("--duration", type=float, default=5,
                   help="Run duration in minutes")
@@ -76,6 +78,8 @@ def parse_args() -> argparse.Namespace:
                   help="Path to config.json")
     p.add_argument("--verbose", action="store_true",
                   help="Verbose logging")
+    p.add_argument("--command", type=str,
+                  help="Natural language command for language mode")
     return p.parse_args()
 
 
@@ -165,6 +169,148 @@ def main() -> int:
             logger.info(f"Analysis: {analysis.description if analysis else 'N/A'}")
 
             return 0
+
+        # Language mode: Execute natural language commands
+        if args.mode in ["language", "interactive"]:
+            logger.info("=" * 70)
+            logger.info("Language Control Mode - Vision-Language-Action System")
+            logger.info("=" * 70)
+
+            language_controller = LanguageController(config)
+
+            if args.mode == "language":
+                # Single command mode
+                if not args.command:
+                    logger.error("--command required for language mode")
+                    logger.info("Example: python main.py --mode language --command 'turn left and explore'")
+                    return 1
+
+                logger.info(f"Command: {args.command}")
+
+                # Capture scene
+                logger.info("Capturing scene...")
+                image, b64, path = camera.capture(save=True)
+                if not b64:
+                    logger.error("Camera capture failed")
+                    return 2
+
+                # Update world model
+                distance = robot.get_distance()
+                world_model.update_ultrasonic(distance)
+
+                # Get depth
+                depth_map = depth_estimator.estimate_depth(image)
+                depth_info = None
+                if depth_map:
+                    world_model.update_depth(depth_map)
+                    depth_info = depth_map.get_directional_depths()
+
+                # Understand scene
+                logger.info("Understanding scene...")
+                scene = language_controller.understand_scene(b64, depth_info)
+                if scene:
+                    logger.info(f"Scene: {scene.spatial_layout}")
+                    logger.info(f"Objects: {', '.join(scene.objects)}")
+                    logger.info(f"Navigable: {', '.join(scene.navigable_areas)}")
+
+                # Parse command
+                logger.info("Parsing command...")
+                world_state = {
+                    'front_distance': distance,
+                    'free_space': world_model.free_space_score,
+                    'best_direction': world_model.get_best_direction()
+                }
+                command = language_controller.parse_command(args.command, scene, world_state)
+
+                if not command:
+                    logger.error("Failed to parse command")
+                    return 1
+
+                if command.confidence < 0.5:
+                    logger.warning(f"Low confidence ({command.confidence:.2f}) - may not be safe")
+                    logger.warning(f"Reasoning: {command.reasoning}")
+                    return 1
+
+                # Execute command
+                logger.info("Executing command...")
+                success = language_controller.execute_command(command, robot, logger)
+
+                if success:
+                    logger.info("Command completed successfully!")
+                    return 0
+                else:
+                    logger.error("Command execution failed")
+                    return 1
+
+            elif args.mode == "interactive":
+                # Interactive mode - keep asking for commands
+                logger.info("Interactive mode - type 'quit' to exit")
+                logger.info("Example commands:")
+                logger.info("  - 'turn left and move forward'")
+                logger.info("  - 'find a clear path'")
+                logger.info("  - 'explore to the right'")
+                logger.info("  - 'back up and turn around'")
+                logger.info("")
+
+                while True:
+                    try:
+                        # Get command from user
+                        user_input = input("Command> ").strip()
+
+                        if user_input.lower() in ['quit', 'exit', 'q']:
+                            logger.info("Exiting interactive mode")
+                            break
+
+                        if not user_input:
+                            continue
+
+                        # Capture fresh scene
+                        logger.info("Capturing scene...")
+                        image, b64, path = camera.capture(save=args.verbose)
+                        if not b64:
+                            logger.error("Camera capture failed")
+                            continue
+
+                        # Update sensors
+                        distance = robot.get_distance()
+                        world_model.update_ultrasonic(distance)
+
+                        # Get depth
+                        depth_map = depth_estimator.estimate_depth(image)
+                        depth_info = None
+                        if depth_map:
+                            world_model.update_depth(depth_map)
+                            depth_info = depth_map.get_directional_depths()
+
+                        # Understand scene
+                        scene = language_controller.understand_scene(b64, depth_info)
+                        if scene:
+                            logger.info(f"I see: {', '.join(scene.objects[:3])}")
+
+                        # Parse and execute
+                        world_state = {
+                            'front_distance': distance,
+                            'free_space': world_model.free_space_score,
+                            'best_direction': world_model.get_best_direction()
+                        }
+                        command = language_controller.parse_command(user_input, scene, world_state)
+
+                        if command and command.confidence >= 0.5:
+                            logger.info(f"Plan: {' -> '.join(command.actions)}")
+                            language_controller.execute_command(command, robot, logger)
+                        else:
+                            logger.warning("Could not understand or safely execute that command")
+                            if command:
+                                logger.warning(f"Reason: {command.reasoning}")
+
+                    except KeyboardInterrupt:
+                        logger.info("\nExiting interactive mode")
+                        break
+                    except EOFError:
+                        logger.info("\nExiting interactive mode")
+                        break
+
+                return 0
 
         # Build behavior tree based on mode
         if args.mode == "cautious":
