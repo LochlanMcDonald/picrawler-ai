@@ -35,6 +35,7 @@ from planning.behavior_tree import (
 )
 from planning.ai_planner import AIPlanner
 from planning.language_controller import LanguageController
+from mapping.slam_controller import SLAMController
 
 
 def setup_logging(log_level: str = "INFO") -> None:
@@ -70,7 +71,7 @@ def load_config(config_path: str) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PiCrawler-AI v4 - Robust Architecture")
     p.add_argument("--mode", default="explore",
-                  choices=["explore", "cautious", "test", "language", "interactive"],
+                  choices=["explore", "cautious", "test", "language", "interactive", "slam", "slam_explore"],
                   help="Operation mode")
     p.add_argument("--duration", type=float, default=5,
                   help="Run duration in minutes")
@@ -311,6 +312,95 @@ def main() -> int:
                         break
 
                 return 0
+
+        # SLAM mode: Build map while exploring
+        if args.mode in ["slam", "slam_explore"]:
+            logger.info("=" * 70)
+            logger.info("SLAM Mode - Simultaneous Localization and Mapping")
+            logger.info("=" * 70)
+
+            slam_controller = SLAMController(map_size_m=10.0, resolution_m=0.05)
+
+            # Create behavior context for exploration (if slam_explore)
+            if args.mode == "slam_explore":
+                behavior_tree = build_exploration_tree()
+                context = BehaviorContext(world_model, memory, robot, logger)
+
+            end_time = time.time() + (args.duration * 60)
+            capture_interval = 1.0  # SLAM needs frequent updates
+            last_capture = 0.0
+            last_action = None
+            frame_count = 0
+
+            logger.info(f"Starting {args.duration} minute SLAM session...")
+            logger.info(f"Map will be saved to logs/slam_map_final.jpg")
+
+            while time.time() < end_time:
+                loop_start = time.time()
+
+                # Capture frame
+                if loop_start - last_capture >= capture_interval:
+                    try:
+                        image, b64, img_path = camera.capture(save=False)
+
+                        if image is not None:
+                            # Get depth estimation
+                            depth_map = depth_estimator.estimate_depth(image)
+
+                            # Process with SLAM
+                            pose, map_vis = slam_controller.process_frame(
+                                image, depth_map, action_hint=last_action
+                            )
+
+                            frame_count += 1
+
+                            # Log pose every 10 frames
+                            if frame_count % 10 == 0:
+                                logger.info(f"Pose: {pose}")
+                                stats = slam_controller.get_statistics()
+                                logger.info(f"Map: {stats['map']['explored_percent']:.1f}% explored")
+
+                            # Save map visualization periodically
+                            if frame_count % 50 == 0:
+                                slam_controller.save_map(f'logs/slam_map_{frame_count}.jpg')
+
+                            last_capture = loop_start
+
+                    except Exception as e:
+                        logger.error(f"SLAM frame processing failed: {e}")
+
+                # Execute behavior if in slam_explore mode
+                if args.mode == "slam_explore":
+                    # Update sensors
+                    distance = robot.get_distance()
+                    world_model.update_ultrasonic(distance)
+
+                    # Execute behavior tree
+                    status = behavior_tree.execute(context)
+
+                    # Track last action for odometry hint
+                    # This is a simplification - in real code, track actual executed action
+                    last_action = "forward"  # Placeholder
+
+                else:
+                    # Pure SLAM mode - just capture and map, no movement
+                    time.sleep(0.5)
+
+                # Small sleep
+                time.sleep(0.1)
+
+            # Save final map
+            logger.info("SLAM session complete!")
+            slam_controller.save_map('logs/slam_map_final.jpg')
+
+            stats = slam_controller.get_statistics()
+            logger.info("Final statistics:")
+            logger.info(f"  Total distance: {stats['odometry']['total_distance_m']:.2f}m")
+            logger.info(f"  Total rotation: {stats['odometry']['total_rotation_deg']:.1f}°")
+            logger.info(f"  Map explored: {stats['map']['explored_percent']:.1f}%")
+            logger.info(f"  Frames processed: {frame_count}")
+
+            return 0
 
         # Build behavior tree based on mode
         if args.mode == "cautious":
