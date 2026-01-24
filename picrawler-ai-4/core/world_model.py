@@ -2,14 +2,17 @@
 Unified world model combining all sensor inputs.
 
 This provides a single source of truth about the robot's environment,
-fusing ultrasonic sensor, vision AI, and other data sources.
+fusing ultrasonic sensor, vision AI, depth estimation, and other data sources.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from perception.depth_estimator import DepthMap
 
 
 @dataclass
@@ -87,6 +90,65 @@ class WorldModel:
                 source='vision',
                 detected=vision_sees_obstacle
             )
+
+        self.last_update = time.time()
+
+    def update_depth(self, depth_map: 'DepthMap') -> None:
+        """Update obstacle information from learned depth map.
+
+        Args:
+            depth_map: Monocular depth estimation result
+        """
+        if depth_map is None:
+            return
+
+        # Get depth in cardinal directions (0=close, 1=far)
+        depths = depth_map.get_directional_depths()
+
+        # Convert depth to distance estimate
+        # Depth 0.0 (close) -> ~10cm, Depth 1.0 (far) -> ~200cm
+        # This is approximate - learned depth has no absolute scale
+        def depth_to_distance(depth_value: float) -> float:
+            """Convert normalized depth to estimated distance in cm."""
+            # Inverse relationship: close objects have low depth value
+            # Map 0-1 depth to 10-200cm range
+            return 10 + (depth_value * 190)
+
+        # Update obstacles with depth information
+        for direction in ['front', 'left', 'right']:
+            depth_value = depths[direction]
+            estimated_distance = depth_to_distance(depth_value)
+
+            # Determine if this is an obstacle
+            is_obstacle = estimated_distance < self.obstacle_threshold_cm
+
+            # Create or update obstacle info
+            current_obs = self.obstacles.get(
+                direction,
+                ObstacleInfo(None, 0.0, 'unknown', False)
+            )
+
+            # If we have ultrasonic for front, fuse it with depth
+            if direction == 'front' and current_obs.source == 'ultrasonic':
+                # Ultrasonic has priority, but depth can confirm
+                if is_obstacle and current_obs.detected:
+                    # Both agree - increase confidence
+                    current_obs.confidence = 0.98
+                    current_obs.source = 'fused_ultrasonic_depth'
+                elif not is_obstacle and not current_obs.detected:
+                    # Both agree it's clear - increase confidence
+                    current_obs.confidence = 0.95
+                    current_obs.source = 'fused_ultrasonic_depth'
+                # If they disagree, trust ultrasonic more (keep as is)
+            else:
+                # No ultrasonic, use depth estimation
+                # Depth has lower confidence than physical sensors
+                self.obstacles[direction] = ObstacleInfo(
+                    distance_cm=estimated_distance,
+                    confidence=0.7,  # Good but not perfect
+                    source='depth_estimation',
+                    detected=is_obstacle
+                )
 
         self.last_update = time.time()
 

@@ -26,6 +26,7 @@ from core.spatial_memory import SpatialMemory
 from core.robot_controller import RobotController
 from perception.camera import CameraSystem, CameraPanicException
 from perception.vision_ai import VisionAI
+from perception.depth_estimator import DepthEstimator
 from planning.behavior_tree import (
     build_exploration_tree,
     build_cautious_exploration_tree,
@@ -103,6 +104,11 @@ def main() -> int:
         # Perception
         camera = CameraSystem(config)
         vision_ai = VisionAI(config)
+        depth_estimator = DepthEstimator(
+            model_type="MiDaS_small",  # Pi-optimized
+            input_size=256,  # Lower resolution for speed
+            cache_duration_s=1.0  # Update depth every second
+        )
 
         # Planning
         ai_planner = AIPlanner(config)
@@ -120,14 +126,29 @@ def main() -> int:
         if args.mode == "test":
             logger.info("Running test mode...")
 
-            _, b64, path = camera.capture(save=True)
+            image, b64, path = camera.capture(save=True)
             if not b64:
                 logger.error("Camera test failed")
                 return 2
 
-            # Update world model with sensor
+            # Update world model with sensors
             distance = robot.get_distance()
             world_model.update_ultrasonic(distance)
+
+            # Estimate depth from image
+            logger.info("Estimating depth...")
+            depth_map = depth_estimator.estimate_depth(image, force_refresh=True)
+            if depth_map:
+                world_model.update_depth(depth_map)
+                logger.info(f"Depth inference: {depth_map.inference_time_ms:.1f}ms")
+                logger.info(f"Directional depths: {depth_map.get_directional_depths()}")
+
+                # Save depth visualization
+                import cv2
+                depth_viz = depth_estimator.visualize_depth(depth_map)
+                depth_path = path.replace('.jpg', '_depth.jpg')
+                cv2.imwrite(depth_path, depth_viz)
+                logger.info(f"Depth map saved: {depth_path}")
 
             # Get vision analysis
             analysis = vision_ai.analyze_scene(b64)
@@ -175,9 +196,22 @@ def main() -> int:
             # Camera capture (throttled)
             if loop_start - last_capture >= capture_interval:
                 try:
-                    _, b64, _ = camera.capture(save=args.verbose)
+                    image, b64, img_path = camera.capture(save=args.verbose)
 
                     if b64:
+                        # Depth estimation (runs every capture due to cache)
+                        depth_map = depth_estimator.estimate_depth(image)
+                        if depth_map:
+                            world_model.update_depth(depth_map)
+                            logger.debug(f"Depth: {depth_map.inference_time_ms:.1f}ms")
+
+                            # Save depth visualization in verbose mode
+                            if args.verbose and img_path:
+                                import cv2
+                                depth_viz = depth_estimator.visualize_depth(depth_map)
+                                depth_path = img_path.replace('.jpg', '_depth.jpg')
+                                cv2.imwrite(depth_path, depth_viz)
+
                         # Vision analysis
                         analysis = vision_ai.analyze_scene(b64)
 
