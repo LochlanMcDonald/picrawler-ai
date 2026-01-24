@@ -14,11 +14,11 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
 try:
-    import anthropic
-    ANTHROPIC_AVAILABLE = True
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
-    logging.warning("Anthropic library not available - language control disabled")
+    OPENAI_AVAILABLE = False
+    logging.warning("OpenAI library not available - language control disabled")
 
 
 @dataclass
@@ -62,19 +62,18 @@ class LanguageController:
         self.config = config
 
         # Get API key
-        api_key = os.getenv("ANTHROPIC_API_KEY")
+        api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            self.logger.warning("ANTHROPIC_API_KEY not set - using OpenAI fallback")
-            api_key = os.getenv("OPENAI_API_KEY")
+            self.logger.error("OPENAI_API_KEY not set")
 
         self.api_key = api_key
         self.client = None
 
-        if ANTHROPIC_AVAILABLE and api_key:
-            self.client = anthropic.Anthropic(api_key=api_key)
-            self.logger.info("Language controller initialized with Claude")
+        if OPENAI_AVAILABLE and api_key:
+            self.client = OpenAI(api_key=api_key)
+            self.logger.info("Language controller initialized with OpenAI GPT-4 Vision")
         else:
-            self.logger.warning("Language controller unavailable - missing dependencies")
+            self.logger.warning("Language controller unavailable - missing dependencies or API key")
 
         # Command history
         self.command_history: List[LanguageCommand] = []
@@ -117,18 +116,16 @@ Respond in this exact JSON format:
     "suggested_actions": ["action1", "action2"]
 }}"""
 
-            response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
                 max_tokens=1024,
                 messages=[{
                     "role": "user",
                     "content": [
                         {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_b64
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}"
                             }
                         },
                         {
@@ -141,7 +138,7 @@ Respond in this exact JSON format:
 
             # Parse response
             import json
-            result = json.loads(response.content[0].text)
+            result = json.loads(response.choices[0].message.content)
 
             return SceneDescription(
                 objects=result.get("objects", []),
@@ -212,8 +209,8 @@ Rules:
 - Consider the current scene and obstacles
 - If you can't fulfill the command safely, return confidence < 0.5"""
 
-            response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
                 max_tokens=512,
                 messages=[{
                     "role": "user",
@@ -223,7 +220,7 @@ Rules:
 
             # Parse response
             import json
-            result = json.loads(response.content[0].text)
+            result = json.loads(response.choices[0].message.content)
 
             language_cmd = LanguageCommand(
                 text=command_text,

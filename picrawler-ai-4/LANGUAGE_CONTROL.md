@@ -21,10 +21,10 @@ User: "Turn left and find a clear path"
   ↓
 [Camera captures scene]
   ↓
-[Claude Vision understands scene]
+[GPT-4 Vision understands scene]
   → "I see: wall ahead, open space to the left, chair on right"
   ↓
-[Claude parses command with scene context]
+[GPT-4 parses command with scene context]
   → Intent: navigate
   → Plan: [turn_left, scan, forward]
   → Reasoning: "Left area appears most navigable"
@@ -46,28 +46,21 @@ cd ~/picrawler-ai/picrawler-ai-4
 git pull
 ```
 
-### 2. Install Dependencies
+### 2. Set Up API Key
 
-```bash
-source .venv/bin/activate  # or use v3's venv
-pip install anthropic
-```
-
-### 3. Set Up API Key
-
-You need an Anthropic API key for Claude:
+You need an OpenAI API key for GPT-4 Vision:
 
 ```bash
 # Add to your ~/.bashrc or ~/.zshrc
-export ANTHROPIC_API_KEY="your-api-key-here"
+export OPENAI_API_KEY="your-api-key-here"
 
 # Or create .env file in picrawler-ai-4/
-echo "ANTHROPIC_API_KEY=your-key" >> .env
+echo "OPENAI_API_KEY=your-key" >> .env
 ```
 
-Get your API key from: https://console.anthropic.com/
+Get your API key from: https://platform.openai.com/api-keys
 
-**Note**: If you don't have an Anthropic key, the system will fall back to OpenAI (but with reduced vision-language capabilities).
+**Note**: The openai library should already be installed from previous steps (it's in requirements.txt).
 
 ## Usage Modes
 
@@ -275,7 +268,7 @@ Commands referencing specific objects:
 "explore near the wall"
 ```
 
-**Note**: Object recognition depends on what Claude can identify in the image.
+**Note**: Object recognition depends on what GPT-4 Vision can identify in the image.
 
 ## What Makes This Cutting Edge
 
@@ -310,18 +303,18 @@ This is **embodied AI** - the frontier of robotics.
 
 ## Troubleshooting
 
-### "Anthropic library not available"
+### "OpenAI library not available"
 
 **Solution**: Install the library
 ```bash
-pip install anthropic
+pip install openai
 ```
 
-### "ANTHROPIC_API_KEY not set"
+### "OPENAI_API_KEY not set"
 
 **Solution**: Export your API key
 ```bash
-export ANTHROPIC_API_KEY="your-key-here"
+export OPENAI_API_KEY="your-key-here"
 ```
 
 Or add to `.env` file.
@@ -370,11 +363,11 @@ This is normal for VLA systems! Real-time optimization comes in Phase 3.
 
 ### API Costs
 
-Claude API usage per command:
-- Scene understanding: ~500-1000 tokens ($0.003-0.006)
-- Command parsing: ~200-400 tokens ($0.0012-0.0024)
+OpenAI API usage per command:
+- Scene understanding (GPT-4o with vision): ~500-1000 tokens (~$0.0025-0.005)
+- Command parsing (GPT-4o-mini): ~200-400 tokens (~$0.00003-0.00006)
 
-**Total cost**: ~$0.005-0.01 per command (very affordable)
+**Total cost**: ~$0.003-0.006 per command (very affordable)
 
 ## Next Steps
 
@@ -419,7 +412,7 @@ User Command
     ↓
 [LanguageController.parse_command()]
     ↓
-Claude API (vision + language reasoning)
+OpenAI GPT-4 (vision + language reasoning)
     ↓
 LanguageCommand (intent, actions, reasoning)
     ↓
