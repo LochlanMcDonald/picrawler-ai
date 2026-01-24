@@ -71,7 +71,7 @@ def load_config(config_path: str) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PiCrawler-AI v4 - Robust Architecture")
     p.add_argument("--mode", default="explore",
-                  choices=["explore", "cautious", "test", "language", "interactive", "slam", "slam_explore"],
+                  choices=["explore", "cautious", "test", "language", "interactive", "slam", "slam_explore", "navigate"],
                   help="Operation mode")
     p.add_argument("--duration", type=float, default=5,
                   help="Run duration in minutes")
@@ -81,6 +81,8 @@ def parse_args() -> argparse.Namespace:
                   help="Verbose logging")
     p.add_argument("--command", type=str,
                   help="Natural language command for language mode")
+    p.add_argument("--goal", type=str,
+                  help="Navigation goal coordinates as 'x,y' (e.g., '1.5,0.8')")
     return p.parse_args()
 
 
@@ -401,6 +403,133 @@ def main() -> int:
             logger.info(f"  Frames processed: {frame_count}")
 
             return 0
+
+        # Navigate mode: Waypoint navigation using SLAM
+        if args.mode == "navigate":
+            logger.info("=" * 70)
+            logger.info("Navigate Mode - Waypoint Navigation with SLAM")
+            logger.info("=" * 70)
+
+            if not args.goal:
+                logger.error("--goal required for navigate mode")
+                logger.info("Example: python main.py --mode navigate --goal '1.5,0.8'")
+                return 1
+
+            # Parse goal coordinates
+            try:
+                goal_parts = args.goal.split(',')
+                goal_x = float(goal_parts[0])
+                goal_y = float(goal_parts[1])
+            except (ValueError, IndexError):
+                logger.error(f"Invalid goal format: {args.goal}. Use 'x,y' format (e.g., '1.5,0.8')")
+                return 1
+
+            logger.info(f"Navigation goal: ({goal_x:.2f}, {goal_y:.2f})")
+
+            slam_controller = SLAMController(map_size_m=10.0, resolution_m=0.05)
+
+            # Build initial map first
+            logger.info("Building initial map (exploring for 30 seconds)...")
+            behavior_tree = build_exploration_tree()
+            context = BehaviorContext(world_model, memory, robot, logger)
+
+            explore_end_time = time.time() + 30  # 30 seconds of exploration
+            last_capture = 0.0
+
+            while time.time() < explore_end_time:
+                loop_start = time.time()
+
+                # Capture and process with SLAM
+                if loop_start - last_capture >= 1.0:
+                    image, b64, _ = camera.capture(save=False)
+                    if image is not None:
+                        depth_map = depth_estimator.estimate_depth(image)
+                        pose, map_vis = slam_controller.process_frame(image, depth_map, action_hint="forward")
+                        last_capture = loop_start
+
+                # Update sensors and explore
+                distance = robot.get_distance()
+                world_model.update_ultrasonic(distance)
+                behavior_tree.execute(context)
+
+                time.sleep(0.1)
+
+            # Plan path to goal
+            logger.info("Planning path to goal...")
+            path = slam_controller.plan_path_to_goal(goal_x, goal_y)
+
+            if not path:
+                logger.error("Could not find path to goal")
+                logger.info("Map may not be sufficiently explored or goal is unreachable")
+                slam_controller.save_map('logs/navigate_failed_map.jpg')
+                return 1
+
+            logger.info(f"Path planned with {len(path)} waypoints")
+            slam_controller.save_map('logs/navigate_planned_path.jpg')
+
+            # Follow the path
+            logger.info("Following path...")
+            nav_start_time = time.time()
+            max_nav_time = 300  # 5 minutes max
+
+            while slam_controller.is_navigating() and (time.time() - nav_start_time) < max_nav_time:
+                loop_start = time.time()
+
+                # Update SLAM
+                if loop_start - last_capture >= 1.0:
+                    image, b64, _ = camera.capture(save=False)
+                    if image is not None:
+                        depth_map = depth_estimator.estimate_depth(image)
+                        pose, map_vis = slam_controller.process_frame(image, depth_map)
+                        last_capture = loop_start
+
+                # Check for obstacles
+                distance = robot.get_distance()
+                obstacle_detected = distance is not None and distance < 20.0
+
+                # Get navigation command
+                nav_cmd = slam_controller.get_navigation_command(obstacle_detected)
+
+                if nav_cmd:
+                    logger.info(f"Nav command: {nav_cmd.action} for {nav_cmd.duration:.1f}s ({nav_cmd.reason})")
+
+                    if nav_cmd.action == "stop":
+                        robot.execute("stop", nav_cmd.duration)
+                        if "goal_reached" in nav_cmd.reason:
+                            logger.info("Navigation complete - goal reached!")
+                            break
+                        elif "obstacle" in nav_cmd.reason or "blocked" in nav_cmd.reason:
+                            logger.warning("Navigation blocked by obstacle")
+                            # Try to replan
+                            logger.info("Attempting to replan...")
+                            new_path = slam_controller.plan_path_to_goal(goal_x, goal_y)
+                            if new_path:
+                                logger.info(f"Replanned with {len(new_path)} waypoints")
+                            else:
+                                logger.error("Replan failed - cannot reach goal")
+                                break
+                        else:
+                            logger.error(f"Navigation failed: {nav_cmd.reason}")
+                            break
+                    else:
+                        robot.execute(nav_cmd.action, nav_cmd.duration)
+
+                # Log progress
+                progress = slam_controller.get_navigation_progress()
+                if loop_start % 5 < 0.2:  # Every ~5 seconds
+                    logger.info(f"Progress: {progress['progress_percent']:.1f}% ({progress['waypoints_reached']}/{progress['waypoints_total']} waypoints)")
+
+                time.sleep(0.1)
+
+            # Save final map
+            slam_controller.save_map('logs/navigate_final_map.jpg')
+
+            if slam_controller.waypoint_navigator.is_complete():
+                logger.info("Navigation succeeded!")
+                return 0
+            else:
+                logger.error("Navigation failed or timed out")
+                return 1
 
         # Build behavior tree based on mode
         if args.mode == "cautious":

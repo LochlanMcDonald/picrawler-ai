@@ -19,6 +19,8 @@ import numpy as np
 from perception.visual_odometry import VisualOdometry, Pose2D, MotionEstimate
 from perception.depth_estimator import DepthMap
 from mapping.occupancy_grid import OccupancyGrid
+from mapping.path_planner import PathPlanner
+from mapping.waypoint_navigator import WaypointNavigator, NavigationCommand
 
 
 class SLAMController:
@@ -44,12 +46,20 @@ class SLAMController:
             resolution_m=resolution_m
         )
 
+        # Path planning and navigation
+        self.path_planner = PathPlanner(self.occupancy_grid)
+        self.waypoint_navigator = WaypointNavigator(
+            position_tolerance_m=0.15,
+            heading_tolerance_deg=15.0
+        )
+
         # State
         self.initialized = False
         self.last_map_update = 0.0
         self.map_update_interval = 0.5  # Update map every 0.5s
+        self.current_planned_path: Optional[List[Tuple[float, float]]] = None
 
-        self.logger.info("SLAM controller initialized")
+        self.logger.info("SLAM controller initialized with path planning")
 
     def process_frame(self, image: np.ndarray,
                      depth_map: Optional[DepthMap] = None,
@@ -133,11 +143,13 @@ class SLAMController:
         """Get full trajectory history."""
         return self.visual_odometry.get_trajectory()
 
-    def get_map_visualization(self, include_trajectory: bool = False) -> np.ndarray:
-        """Get map visualization with optional trajectory overlay.
+    def get_map_visualization(self, include_trajectory: bool = False,
+                            include_planned_path: bool = True) -> np.ndarray:
+        """Get map visualization with optional trajectory and path overlay.
 
         Args:
             include_trajectory: If True, draw full trajectory on map
+            include_planned_path: If True, draw planned path on map
 
         Returns:
             RGB visualization
@@ -146,7 +158,7 @@ class SLAMController:
         map_vis = self.occupancy_grid.get_visualization(robot_pose=pose)
 
         if include_trajectory and len(self.visual_odometry.pose_history) > 1:
-            # Draw trajectory
+            # Draw trajectory (blue)
             for i in range(len(self.visual_odometry.pose_history) - 1):
                 p1 = self.visual_odometry.pose_history[i]
                 p2 = self.visual_odometry.pose_history[i + 1]
@@ -159,6 +171,27 @@ class SLAMController:
                 gy2_vis = self.occupancy_grid.grid_height - gy2
 
                 cv2.line(map_vis, (gx1, gy1_vis), (gx2, gy2_vis), (255, 0, 0), 1)
+
+        if include_planned_path and self.current_planned_path:
+            # Draw planned path (green)
+            for i in range(len(self.current_planned_path) - 1):
+                x1, y1 = self.current_planned_path[i]
+                x2, y2 = self.current_planned_path[i + 1]
+
+                gx1, gy1 = self.occupancy_grid.world_to_grid(x1, y1)
+                gx2, gy2 = self.occupancy_grid.world_to_grid(x2, y2)
+
+                # Flip y for visualization
+                gy1_vis = self.occupancy_grid.grid_height - gy1
+                gy2_vis = self.occupancy_grid.grid_height - gy2
+
+                cv2.line(map_vis, (gx1, gy1_vis), (gx2, gy2_vis), (0, 255, 0), 2)
+
+            # Draw waypoints as green circles
+            for x, y in self.current_planned_path:
+                gx, gy = self.occupancy_grid.world_to_grid(x, y)
+                gy_vis = self.occupancy_grid.grid_height - gy
+                cv2.circle(map_vis, (gx, gy_vis), 2, (0, 255, 0), -1)
 
         return map_vis
 
@@ -202,6 +235,56 @@ class SLAMController:
         """
         targets = self.find_exploration_targets(num_targets=1)
         return targets[0] if targets else None
+
+    def plan_path_to_goal(self, goal_x: float, goal_y: float) -> Optional[List[Tuple[float, float]]]:
+        """Plan a path to goal coordinates.
+
+        Args:
+            goal_x, goal_y: Goal position in meters
+
+        Returns:
+            List of waypoints or None if no path found
+        """
+        current_pose = self.visual_odometry.get_pose()
+        path = self.path_planner.plan_path(current_pose, goal_x, goal_y)
+
+        if path:
+            self.current_planned_path = path
+            self.waypoint_navigator.set_path(path)
+            self.logger.info(f"Planned path to ({goal_x:.2f}, {goal_y:.2f}) with {len(path)} waypoints")
+        else:
+            self.logger.warning(f"Could not find path to ({goal_x:.2f}, {goal_y:.2f})")
+
+        return path
+
+    def get_navigation_command(self, obstacle_detected: bool = False) -> Optional[NavigationCommand]:
+        """Get next navigation command for waypoint following.
+
+        Args:
+            obstacle_detected: Whether obstacle is currently blocking
+
+        Returns:
+            NavigationCommand or None if not navigating
+        """
+        if not self.waypoint_navigator.is_active():
+            return None
+
+        current_pose = self.visual_odometry.get_pose()
+        return self.waypoint_navigator.get_next_command(current_pose, obstacle_detected)
+
+    def is_navigating(self) -> bool:
+        """Check if currently following a planned path."""
+        return self.waypoint_navigator.is_active()
+
+    def get_navigation_progress(self) -> dict:
+        """Get navigation progress information."""
+        return self.waypoint_navigator.get_progress()
+
+    def cancel_navigation(self) -> None:
+        """Cancel current navigation."""
+        self.waypoint_navigator.reset()
+        self.current_planned_path = None
+        self.logger.info("Navigation cancelled")
 
     def get_statistics(self) -> dict:
         """Get SLAM statistics."""

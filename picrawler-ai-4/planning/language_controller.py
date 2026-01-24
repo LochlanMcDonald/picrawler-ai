@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 try:
     from openai import OpenAI
@@ -31,6 +32,7 @@ class LanguageCommand:
     reasoning: str  # LLM's explanation of the plan
     confidence: float  # Confidence in the plan (0-1)
     timestamp: float
+    navigation_goal: Optional[Tuple[float, float]] = None  # (x, y) coordinates for navigation
 
 
 @dataclass
@@ -152,6 +154,35 @@ Respond in this exact JSON format:
             self.logger.error(f"Scene understanding failed: {e}")
             return None
 
+    def _extract_coordinates(self, command_text: str) -> Optional[Tuple[float, float]]:
+        """Extract (x, y) coordinates from command text.
+
+        Args:
+            command_text: Natural language command
+
+        Returns:
+            (x, y) tuple or None if no coordinates found
+        """
+        # Look for patterns like: "coordinates (1.5, 0.8)", "(1.5, 0.8)", "x=1.5 y=0.8", etc.
+        patterns = [
+            r'coordinates?\s*\(([+-]?\d+\.?\d*)\s*,\s*([+-]?\d+\.?\d*)\)',  # coordinates (x, y)
+            r'\(([+-]?\d+\.?\d*)\s*,\s*([+-]?\d+\.?\d*)\)',  # (x, y)
+            r'x\s*=?\s*([+-]?\d+\.?\d*)\s*,?\s*y\s*=?\s*([+-]?\d+\.?\d*)',  # x=1.5, y=0.8
+            r'position\s*\(([+-]?\d+\.?\d*)\s*,\s*([+-]?\d+\.?\d*)\)'  # position (x, y)
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, command_text.lower())
+            if match:
+                try:
+                    x = float(match.group(1))
+                    y = float(match.group(2))
+                    return (x, y)
+                except (ValueError, IndexError):
+                    continue
+
+        return None
+
     def parse_command(self, command_text: str, scene: Optional[SceneDescription] = None,
                      world_state: Optional[Dict] = None) -> Optional[LanguageCommand]:
         """Parse natural language command into executable actions.
@@ -168,6 +199,9 @@ Respond in this exact JSON format:
             return None
 
         try:
+            # Check for navigation coordinates
+            nav_coords = self._extract_coordinates(command_text)
+
             # Build context
             scene_context = ""
             if scene:
@@ -229,7 +263,8 @@ Rules:
                 actions=result.get("actions", []),
                 reasoning=result.get("reasoning", ""),
                 confidence=result.get("confidence", 0.5),
-                timestamp=time.time()
+                timestamp=time.time(),
+                navigation_goal=nav_coords
             )
 
             self.command_history.append(language_cmd)
@@ -237,6 +272,8 @@ Rules:
 
             self.logger.info(f"Command parsed: {command_text}")
             self.logger.info(f"Intent: {language_cmd.intent}, Actions: {language_cmd.actions}")
+            if nav_coords:
+                self.logger.info(f"Navigation goal: ({nav_coords[0]:.2f}, {nav_coords[1]:.2f})")
             self.logger.info(f"Reasoning: {language_cmd.reasoning}")
 
             return language_cmd
