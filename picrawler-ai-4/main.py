@@ -321,11 +321,11 @@ def main() -> int:
             logger.info("SLAM Mode - Simultaneous Localization and Mapping")
             logger.info("=" * 70)
 
-            slam_controller = SLAMController(map_size_m=10.0, resolution_m=0.05)
+            slam_controller = SLAMController(config)
 
             # Create behavior context for exploration (if slam_explore)
             if args.mode == "slam_explore":
-                behavior_tree = build_exploration_tree()
+                behavior_tree = build_exploration_tree(config)
                 context = BehaviorContext(world_model, memory, robot, logger)
 
             end_time = time.time() + (args.duration * 60)
@@ -426,11 +426,11 @@ def main() -> int:
 
             logger.info(f"Navigation goal: ({goal_x:.2f}, {goal_y:.2f})")
 
-            slam_controller = SLAMController(map_size_m=10.0, resolution_m=0.05)
+            slam_controller = SLAMController(config)
 
             # Build initial map first
             logger.info("Building initial map (exploring for 30 seconds)...")
-            behavior_tree = build_exploration_tree()
+            behavior_tree = build_exploration_tree(config)
             context = BehaviorContext(world_model, memory, robot, logger)
 
             explore_end_time = time.time() + 30  # 30 seconds of exploration
@@ -533,10 +533,10 @@ def main() -> int:
 
         # Build behavior tree based on mode
         if args.mode == "cautious":
-            behavior_tree = build_cautious_exploration_tree()
+            behavior_tree = build_cautious_exploration_tree(config)
             logger.info("Using cautious exploration behavior")
         else:
-            behavior_tree = build_exploration_tree()
+            behavior_tree = build_exploration_tree(config)
             logger.info("Using standard exploration behavior")
 
         # Create behavior context

@@ -168,6 +168,16 @@ class MoveForwardAction(BehaviorNode):
             reason="completed" if success else "blocked"
         )
 
+        # Reset recovery escalation after 3 successful forward movements
+        if success:
+            recent_successes = sum(
+                1 for r in list(context.memory.action_history)[-5:]
+                if r.action == 'forward' and r.success
+            )
+            if recent_successes >= 3:
+                context.memory.reset_recovery_escalation()
+                self.logger.debug("Reset recovery escalation after successful navigation")
+
         return Status.SUCCESS if success else Status.FAILURE
 
 
@@ -249,31 +259,97 @@ class SmartTurnAction(BehaviorNode):
 
 
 class RecoverySequence(BehaviorNode):
-    """Execute full stuck recovery sequence."""
+    """Execute stuck recovery sequence with escalating strategies."""
 
-    def __init__(self):
+    def __init__(self, backup_dur: float = 2.0, turn_dur: float = 1.2, forward_dur: float = 1.5):
         super().__init__("RecoverySequence")
+        self.backup_dur = backup_dur
+        self.turn_dur = turn_dur
+        self.forward_dur = forward_dur
 
     def execute(self, context: BehaviorContext) -> Status:
-        self.logger.warning("Executing recovery sequence!")
+        # Get recovery escalation level
+        recovery_level = context.memory.get_recovery_level()
+
+        if recovery_level == 0:
+            # Light recovery (first time stuck)
+            self.logger.warning("Executing LIGHT recovery (level 0)")
+            strategy = self._light_recovery()
+        elif recovery_level == 1:
+            # Medium recovery
+            self.logger.warning("Executing MEDIUM recovery (level 1)")
+            strategy = self._medium_recovery()
+        elif recovery_level == 2:
+            # Aggressive recovery
+            self.logger.warning("Executing AGGRESSIVE recovery (level 2)")
+            strategy = self._aggressive_recovery()
+        else:
+            # Maximum recovery (very stuck)
+            self.logger.error("Executing MAXIMUM recovery (level 3) - robot is very stuck!")
+            strategy = self._maximum_recovery()
 
         context.memory.record_escape()
 
-        # Recovery: Stop, back up, turn significantly, try forward
-        sequence = SequenceNode("Recovery", [
-            StopAction(),
-            BackupAction(duration=2.0),  # Back up more
-            SmartTurnAction(duration=1.2),  # Turn more
-            MoveForwardAction(duration=1.5),  # Try forward
-        ])
-
-        result = sequence.execute(context)
+        result = strategy.execute(context)
 
         if result == Status.SUCCESS:
             # Reset failure counts after successful recovery
             context.memory.reset_failure_counts()
 
         return result
+
+    def _light_recovery(self) -> BehaviorNode:
+        """Light recovery - minimal maneuver."""
+        return SequenceNode("LightRecovery", [
+            StopAction(),
+            BackupAction(duration=self.backup_dur * 0.75),  # Back up a bit
+            SmartTurnAction(duration=self.turn_dur * 0.8),  # Small turn
+            MoveForwardAction(duration=self.forward_dur * 0.8),
+        ])
+
+    def _medium_recovery(self) -> BehaviorNode:
+        """Medium recovery - standard escape."""
+        return SequenceNode("MediumRecovery", [
+            StopAction(),
+            BackupAction(duration=self.backup_dur),  # Standard backup
+            SmartTurnAction(duration=self.turn_dur),  # Standard turn
+            MoveForwardAction(duration=self.forward_dur),
+        ])
+
+    def _aggressive_recovery(self) -> BehaviorNode:
+        """Aggressive recovery - larger movements."""
+        return SequenceNode("AggressiveRecovery", [
+            StopAction(),
+            BackupAction(duration=self.backup_dur * 1.5),  # Back up more
+            SmartTurnAction(duration=self.turn_dur * 1.5),  # Turn more
+            BackupAction(duration=self.backup_dur * 0.5),  # Another backup
+            SmartTurnAction(duration=self.turn_dur),  # Another turn (opposite direction)
+            MoveForwardAction(duration=self.forward_dur * 1.2),
+        ])
+
+    def _maximum_recovery(self) -> BehaviorNode:
+        """Maximum recovery - multi-step escape with exploration."""
+        return FallbackNode("MaximumRecovery", [
+            # Try 1: Aggressive backward + turn sequence
+            SequenceNode("MaxRecovery1", [
+                StopAction(),
+                BackupAction(duration=self.backup_dur * 2.0),  # Back way up
+                TurnAction('left', duration=self.turn_dur * 1.5),  # Hard left
+                MoveForwardAction(duration=self.forward_dur),
+            ]),
+            # Try 2: Opposite direction
+            SequenceNode("MaxRecovery2", [
+                BackupAction(duration=self.backup_dur * 1.5),
+                TurnAction('right', duration=self.turn_dur * 1.5),  # Hard right
+                MoveForwardAction(duration=self.forward_dur),
+            ]),
+            # Try 3: Just get somewhere different
+            SequenceNode("MaxRecovery3", [
+                BackupAction(duration=self.backup_dur * 2.0),
+                TurnAction('left', duration=self.turn_dur * 2.0),  # Complete turn
+                MoveForwardAction(duration=self.forward_dur * 1.5),
+            ])
+        ])
 
 
 class StopAction(BehaviorNode):
@@ -292,64 +368,112 @@ class StopAction(BehaviorNode):
 # Pre-built Behavior Trees
 # ============================================================================
 
-def build_exploration_tree() -> BehaviorNode:
-    """Build the standard exploration behavior tree."""
+def build_exploration_tree(config: dict = None) -> BehaviorNode:
+    """Build the standard exploration behavior tree.
+
+    Args:
+        config: Configuration dictionary with behavior_tree_settings
+    """
+    if config is None:
+        config = {}
+
+    bt_settings = config.get("behavior_tree_settings", {})
+
+    # Extract configurable durations
+    move_forward_dur = bt_settings.get("move_forward_duration_s", 1.2)
+    turn_dur = bt_settings.get("turn_duration_s", 0.8)
+    smart_turn_dur = bt_settings.get("smart_turn_duration_s", 0.8)
+    backup_dur = bt_settings.get("backup_duration_s", 1.5)
+    aggressive_backup_dur = bt_settings.get("aggressive_backup_duration_s", 1.5)
+    aggressive_turn_dur = bt_settings.get("aggressive_turn_duration_s", 1.2)
+    aggressive_forward_dur = bt_settings.get("aggressive_forward_duration_s", 0.8)
+    recovery_backup_dur = bt_settings.get("recovery_backup_duration_s", 2.0)
+    recovery_turn_dur = bt_settings.get("recovery_turn_duration_s", 1.2)
+    recovery_forward_dur = bt_settings.get("recovery_forward_duration_s", 1.5)
 
     return FallbackNode("ExplorationRoot", [
         # Priority 1: If stuck, try recovery
         SequenceNode("StuckRecovery", [
             CheckStuckCondition(),
-            RecoverySequence()
+            RecoverySequence(
+                backup_dur=recovery_backup_dur,
+                turn_dur=recovery_turn_dur,
+                forward_dur=recovery_forward_dur
+            )
         ]),
 
         # Priority 2: If path clear, move forward
         SequenceNode("MoveForward", [
             CheckPathClear(),
-            MoveForwardAction(duration=1.2)
+            MoveForwardAction(duration=move_forward_dur)
         ]),
 
         # Priority 3: Path blocked, find alternative
         SequenceNode("FindAlternative", [
-            SmartTurnAction(duration=0.9),
+            SmartTurnAction(duration=smart_turn_dur),
             # Check if turn helped
             CheckPathClear(),
-            MoveForwardAction(duration=1.0)
+            MoveForwardAction(duration=move_forward_dur)
         ]),
 
         # Priority 4: Still blocked, aggressive maneuver
         SequenceNode("AggressiveManeuver", [
-            BackupAction(duration=1.5),
-            SmartTurnAction(duration=1.2),
-            MoveForwardAction(duration=0.8)
+            BackupAction(duration=aggressive_backup_dur),
+            SmartTurnAction(duration=aggressive_turn_dur),
+            MoveForwardAction(duration=aggressive_forward_dur)
         ]),
 
         # Priority 5: Last resort - random exploration
         SequenceNode("RandomExplore", [
-            TurnAction('left', duration=1.0),  # Just turn and hope
-            MoveForwardAction(duration=0.5)
+            TurnAction('left', duration=turn_dur),  # Just turn and hope
+            MoveForwardAction(duration=aggressive_forward_dur)
         ])
     ])
 
 
-def build_cautious_exploration_tree() -> BehaviorNode:
-    """Build a more cautious exploration tree (shorter movements)."""
+def build_cautious_exploration_tree(config: dict = None) -> BehaviorNode:
+    """Build a more cautious exploration tree (shorter movements).
+
+    Args:
+        config: Configuration dictionary with behavior_tree_settings
+    """
+    if config is None:
+        config = {}
+
+    bt_settings = config.get("behavior_tree_settings", {})
+
+    # Extract configurable parameters
+    cautious_forward_dur = bt_settings.get("cautious_forward_duration_s", 0.8)
+    smart_turn_dur = bt_settings.get("smart_turn_duration_s", 0.7)
+    cautious_free_space_min = bt_settings.get("cautious_free_space_min_score", 0.5)
+    recovery_backup_dur = bt_settings.get("recovery_backup_duration_s", 2.0)
+    recovery_turn_dur = bt_settings.get("recovery_turn_duration_s", 1.2)
+    recovery_forward_dur = bt_settings.get("recovery_forward_duration_s", 1.5)
 
     return FallbackNode("CautiousExplorationRoot", [
         SequenceNode("StuckRecovery", [
             CheckStuckCondition(),
-            RecoverySequence()
+            RecoverySequence(
+                backup_dur=recovery_backup_dur,
+                turn_dur=recovery_turn_dur,
+                forward_dur=recovery_forward_dur
+            )
         ]),
 
         SequenceNode("CautiousForward", [
             CheckPathClear(),
-            CheckFreeSpace(min_score=0.5),  # Need more free space
-            MoveForwardAction(duration=0.8)  # Shorter movements
+            CheckFreeSpace(min_score=cautious_free_space_min),  # Need more free space
+            MoveForwardAction(duration=cautious_forward_dur)  # Shorter movements
         ]),
 
         SequenceNode("FindAlternative", [
-            SmartTurnAction(duration=0.7),
-            MoveForwardAction(duration=0.6)
+            SmartTurnAction(duration=smart_turn_dur),
+            MoveForwardAction(duration=cautious_forward_dur * 0.75)
         ]),
 
-        RecoverySequence()  # Fallback to recovery
+        RecoverySequence(
+            backup_dur=recovery_backup_dur,
+            turn_dur=recovery_turn_dur,
+            forward_dur=recovery_forward_dur
+        )  # Fallback to recovery
     ])

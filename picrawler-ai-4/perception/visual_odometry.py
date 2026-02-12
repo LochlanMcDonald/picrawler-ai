@@ -41,19 +41,28 @@ class MotionEstimate:
 class VisualOdometry:
     """Track robot motion using visual features."""
 
-    def __init__(self, camera_height_m: float = 0.1, camera_tilt_deg: float = 20.0):
+    def __init__(self, camera_height_m: float = 0.1, camera_tilt_deg: float = 20.0,
+                 scale_calibration_factor: float = 1.0, feature_count: int = 500):
         """
         Args:
             camera_height_m: Camera height above ground
             camera_tilt_deg: Camera tilt angle (down from horizontal)
+            scale_calibration_factor: Multiplier for scale calibration (adjust if robot moves faster/slower than expected)
+            feature_count: Number of ORB features to detect
         """
         self.logger = logging.getLogger(self.__class__.__name__)
 
         self.camera_height_m = camera_height_m
         self.camera_tilt_rad = np.radians(camera_tilt_deg)
+        self.scale_calibration_factor = scale_calibration_factor
 
         # Feature detector (ORB - fast and free)
-        self.detector = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8)
+        self.detector = cv2.ORB_create(nfeatures=feature_count, scaleFactor=1.2, nlevels=8)
+
+        self.logger.info(
+            f"Visual odometry initialized (features={feature_count}, "
+            f"scale_cal={scale_calibration_factor:.2f})"
+        )
 
         # Feature matcher
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)

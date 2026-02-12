@@ -49,30 +49,77 @@ class PathNode:
 class PathPlanner:
     """A* path planner for occupancy grids."""
 
-    def __init__(self, occupancy_grid: OccupancyGrid):
+    def __init__(self, occupancy_grid: OccupancyGrid,
+                 obstacle_inflation_radius: float = 0.15,
+                 occupancy_threshold: float = 0.65):
         """
         Args:
             occupancy_grid: The occupancy grid to plan on
+            obstacle_inflation_radius: Inflate obstacles by this radius (meters) for safety
+            occupancy_threshold: Probability threshold for considering cell occupied
         """
         self.logger = logging.getLogger(self.__class__.__name__)
         self.grid = occupancy_grid
+        self.obstacle_inflation_radius = obstacle_inflation_radius
+        self.occupancy_threshold = occupancy_threshold
+
+        # Calculate inflation radius in grid cells
+        self.inflation_cells = int(np.ceil(obstacle_inflation_radius / occupancy_grid.resolution_m))
 
         # A* parameters
         self.diagonal_cost = 1.414  # sqrt(2)
         self.straight_cost = 1.0
 
+        self.logger.info(
+            f"Path planner initialized (inflation: {obstacle_inflation_radius:.2f}m = "
+            f"{self.inflation_cells} cells, threshold: {occupancy_threshold:.2f})"
+        )
+
+    def _inflate_obstacles(self, prob_map: np.ndarray) -> np.ndarray:
+        """Inflate obstacles for safety margin.
+
+        Args:
+            prob_map: Probability map (0-1, where 1 = occupied)
+
+        Returns:
+            Inflated probability map
+        """
+        if self.inflation_cells <= 0:
+            return prob_map
+
+        # Create binary obstacle map
+        obstacle_map = (prob_map > self.occupancy_threshold).astype(np.uint8)
+
+        # Dilate obstacles using morphological dilation
+        import cv2
+        kernel_size = 2 * self.inflation_cells + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        inflated = cv2.dilate(obstacle_map, kernel, iterations=1)
+
+        # Convert back to probability (inflated obstacles = 1.0)
+        inflated_prob = inflated.astype(np.float32)
+
+        # Preserve original probabilities in non-inflated areas
+        inflated_prob = np.maximum(prob_map, inflated_prob)
+
+        return inflated_prob
+
     def plan_path(self, start_pose: Pose2D, goal_x_m: float, goal_y_m: float,
-                  occupancy_threshold: float = 0.65) -> Optional[List[Tuple[float, float]]]:
+                  occupancy_threshold: float = None) -> Optional[List[Tuple[float, float]]]:
         """Plan a path from start to goal using A*.
 
         Args:
             start_pose: Starting robot pose
             goal_x_m, goal_y_m: Goal position in meters
-            occupancy_threshold: Cells above this probability are obstacles
+            occupancy_threshold: Cells above this probability are obstacles (uses default if None)
 
         Returns:
             List of (x_m, y_m) waypoints from start to goal, or None if no path
         """
+        # Use default threshold if not specified
+        if occupancy_threshold is None:
+            occupancy_threshold = self.occupancy_threshold
+
         # Convert to grid coordinates
         start_gx, start_gy = self.grid.world_to_grid(start_pose.x, start_pose.y)
         goal_gx, goal_gy = self.grid.world_to_grid(goal_x_m, goal_y_m)
@@ -86,14 +133,15 @@ class PathPlanner:
             self.logger.error(f"Goal position out of bounds: ({goal_x_m}, {goal_y_m})")
             return None
 
-        # Get probability map
+        # Get probability map and inflate obstacles
         prob_map = self.grid.get_probability_map()
+        inflated_map = self._inflate_obstacles(prob_map)
 
-        # Check if goal is occupied
-        if prob_map[goal_gy, goal_gx] > occupancy_threshold:
-            self.logger.warning(f"Goal position is occupied (prob={prob_map[goal_gy, goal_gx]:.2f})")
+        # Check if goal is occupied (use inflated map for safety)
+        if inflated_map[goal_gy, goal_gx] > occupancy_threshold:
+            self.logger.warning(f"Goal position is occupied (inflated prob={inflated_map[goal_gy, goal_gx]:.2f})")
             # Try to find nearby free cell
-            goal_gx, goal_gy = self._find_nearest_free_cell(goal_gx, goal_gy, prob_map, occupancy_threshold)
+            goal_gx, goal_gy = self._find_nearest_free_cell(goal_gx, goal_gy, inflated_map, occupancy_threshold)
             if goal_gx is None:
                 self.logger.error("Could not find free cell near goal")
                 return None
@@ -135,8 +183,8 @@ class PathPlanner:
                 if (neighbor_gx, neighbor_gy) in closed_set:
                     continue
 
-                # Skip if occupied
-                if prob_map[neighbor_gy, neighbor_gx] > occupancy_threshold:
+                # Skip if occupied (use inflated map for safety margin)
+                if inflated_map[neighbor_gy, neighbor_gx] > occupancy_threshold:
                     continue
 
                 # Calculate g_cost

@@ -39,6 +39,11 @@ class SpatialMemory:
         self.last_escape_time: float = 0.0
         self.escape_count: int = 0
 
+        # Recovery escalation tracking
+        self.recovery_level: int = 0  # 0=none, 1=light, 2=medium, 3=aggressive
+        self.consecutive_stuck_count: int = 0
+        self.last_stuck_time: float = 0.0
+
         # Directional preferences (which turns work better)
         self.turn_outcomes: Dict[str, List[bool]] = {
             'turn_left': [],
@@ -214,9 +219,37 @@ class SpatialMemory:
         self.last_escape_time = time.time()
         self.escape_count += 1
 
+        # Escalate recovery level if stuck again soon
+        time_since_last_stuck = time.time() - self.last_stuck_time
+        if time_since_last_stuck < 30:  # Stuck again within 30s
+            self.consecutive_stuck_count += 1
+            self.recovery_level = min(3, self.consecutive_stuck_count)
+        else:
+            # Been a while since last stuck, reset escalation
+            self.consecutive_stuck_count = 1
+            self.recovery_level = 1
+
+        self.last_stuck_time = time.time()
+
     def reset_failure_counts(self) -> None:
         """Reset failure tracking (after successful escape)."""
         self.failure_counts.clear()
+
+    def reset_recovery_escalation(self) -> None:
+        """Reset recovery escalation after successful navigation."""
+        self.recovery_level = 0
+        self.consecutive_stuck_count = 0
+
+    def get_recovery_level(self) -> int:
+        """Get current recovery escalation level (0-3).
+
+        Returns:
+            0 = No recovery needed
+            1 = Light recovery (first time stuck)
+            2 = Medium recovery (stuck again within 30s)
+            3 = Aggressive recovery (stuck multiple times)
+        """
+        return self.recovery_level
 
     def get_recent_actions(self, n: int = 10) -> List[str]:
         """Get list of N most recent actions."""

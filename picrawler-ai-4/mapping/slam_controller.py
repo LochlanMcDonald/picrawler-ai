@@ -26,18 +26,34 @@ from mapping.waypoint_navigator import WaypointNavigator, NavigationCommand
 class SLAMController:
     """Simultaneous Localization and Mapping controller."""
 
-    def __init__(self, map_size_m: float = 10.0, resolution_m: float = 0.05):
+    def __init__(self, config: dict = None):
         """
         Args:
-            map_size_m: Size of map (square)
-            resolution_m: Grid resolution in meters
+            config: Configuration dictionary
         """
         self.logger = logging.getLogger(self.__class__.__name__)
 
+        # Load SLAM settings from config
+        if config is None:
+            config = {}
+
+        slam_settings = config.get("slam_settings", {})
+        map_size_m = slam_settings.get("map_size_m", 20.0)  # Increased from 10m
+        resolution_m = slam_settings.get("map_resolution_m", 0.05)
+
+        vo_settings = config.get("visual_odometry_settings", {})
+        camera_height = vo_settings.get("camera_height_m", 0.1)
+        camera_tilt = vo_settings.get("camera_tilt_deg", 20.0)
+
+        path_settings = config.get("path_planning_settings", {})
+        nav_settings = config.get("navigation_settings", {})
+
         # Initialize components
         self.visual_odometry = VisualOdometry(
-            camera_height_m=0.1,
-            camera_tilt_deg=20.0
+            camera_height_m=camera_height,
+            camera_tilt_deg=camera_tilt,
+            scale_calibration_factor=vo_settings.get("scale_calibration_factor", 1.0),
+            feature_count=vo_settings.get("feature_count", 500)
         )
 
         self.occupancy_grid = OccupancyGrid(
@@ -47,10 +63,14 @@ class SLAMController:
         )
 
         # Path planning and navigation
-        self.path_planner = PathPlanner(self.occupancy_grid)
+        self.path_planner = PathPlanner(
+            self.occupancy_grid,
+            obstacle_inflation_radius=path_settings.get("obstacle_inflation_radius_m", 0.15),
+            occupancy_threshold=path_settings.get("occupancy_threshold", 0.65)
+        )
         self.waypoint_navigator = WaypointNavigator(
-            position_tolerance_m=0.15,
-            heading_tolerance_deg=15.0
+            position_tolerance_m=nav_settings.get("position_tolerance_m", 0.15),
+            heading_tolerance_deg=nav_settings.get("heading_tolerance_deg", 15.0)
         )
 
         # State
