@@ -47,14 +47,9 @@ def main() -> int:
             "No OpenAI API key set. Set OPENAI_API_KEY env var or config/openai_api_key. AI calls will fail."
         )
 
-    # --- Improvement #1: Throttle AI calls to reduce cost/jitter ---
-    ai_settings = config.get("ai_settings", {})
-    min_seconds_between_calls = float(ai_settings.get("min_seconds_between_calls", 3.0))
-    AIVisionSystem.MIN_SECONDS_BETWEEN_CALLS = min_seconds_between_calls  # type: ignore[attr-defined]
-    # -------------------------------------------------------------
-
     robot: RobotController | None = None
     camera: CameraSystem | None = None
+    ai: AIVisionSystem | None = None
 
     try:
         robot = RobotController(config)
@@ -105,17 +100,38 @@ def main() -> int:
 
     finally:
         # --- HARD SAFETY STOP (always runs) ---
+        cleanup_errors = []
+
+        # Stop robot movement (highest priority)
         if robot is not None:
             try:
                 robot.execute("stop", 0.2)
-            except Exception:
-                pass
+            except Exception as e:
+                cleanup_errors.append(f"robot stop: {e}")
 
+        # Close camera resources
         if camera is not None:
             try:
                 camera.close()
-            except Exception:
+            except Exception as e:
+                cleanup_errors.append(f"camera close: {e}")
+
+        # Cleanup AI/voice system if needed
+        if ai is not None:
+            try:
+                # Voice system doesn't need explicit cleanup currently,
+                # but adding hook for future resource cleanup
                 pass
+            except Exception as e:
+                cleanup_errors.append(f"ai cleanup: {e}")
+
+        # Log any cleanup errors (avoid masking original exceptions)
+        for error in cleanup_errors:
+            try:
+                logger.error(f"Cleanup failed: {error}")
+            except Exception:
+                # Logger might not be available if initialization failed
+                print(f"ERROR: Cleanup failed: {error}", file=sys.stderr)
         # -------------------------------------
 
 
