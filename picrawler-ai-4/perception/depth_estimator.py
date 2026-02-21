@@ -14,6 +14,7 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+from PIL import Image
 
 try:
     import torch
@@ -128,12 +129,12 @@ class DepthEstimator:
             self.logger.error(f"Failed to load depth model: {e}")
             self.model = None
 
-    def estimate_depth(self, image: np.ndarray,
+    def estimate_depth(self, image,
                       force_refresh: bool = False) -> Optional[DepthMap]:
         """Estimate depth from RGB image.
 
         Args:
-            image: RGB image (H, W, 3) as numpy array
+            image: RGB image as numpy array (H, W, 3) or PIL Image
             force_refresh: Skip cache and run new inference
 
         Returns:
@@ -151,6 +152,10 @@ class DepthEstimator:
 
         try:
             start_time = time.time()
+
+            # Convert PIL Image to numpy array if needed
+            if isinstance(image, Image.Image):
+                image = np.array(image)
 
             # Resize input for faster inference on Pi
             if image.shape[0] > self.input_size or image.shape[1] > self.input_size:

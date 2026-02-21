@@ -63,10 +63,11 @@ class LanguageController:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.config = config
 
-        # Get API key
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            self.logger.error("OPENAI_API_KEY not set")
+        # Get API key from config or environment variable
+        api_key = config.get("openai_api_key") or os.getenv("OPENAI_API_KEY")
+        if not api_key or api_key == "your-api-key-here":
+            self.logger.error("OPENAI_API_KEY not set in config or environment")
+            api_key = None
 
         self.api_key = api_key
         self.client = None
