@@ -1,17 +1,21 @@
 """
-SLAM Controller integrating visual odometry and occupancy mapping.
+SLAM Controller — full stack with loop closure and 3D mapping.
 
 Coordinates:
-- Visual odometry for pose tracking
-- Depth estimation for obstacle detection
-- Occupancy grid mapping for spatial representation
+  VisualOdometry  → raw pose estimates
+  KeyframeStore   → sparse keyframe database
+  LoopClosureDetector → place recognition
+  PoseGraph       → drift-corrected trajectory
+  PointCloudBuilder   → semi-dense 3D map
+  OccupancyGrid   → 2D navigation map (fed from point cloud obstacle mask)
+  MapServer       → real-time UDP stream to host visualiser
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Optional, Tuple, List
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -21,322 +25,437 @@ from perception.depth_estimator import DepthMap
 from mapping.occupancy_grid import OccupancyGrid
 from mapping.path_planner import PathPlanner
 from mapping.waypoint_navigator import WaypointNavigator, NavigationCommand
+from mapping.keyframe import KeyframeStore
+from mapping.loop_closure import LoopClosureDetector
+from mapping.pose_graph import PoseGraph
+from mapping.point_cloud import PointCloudBuilder
+from mapping.map_server import MapServer
 
 
 class SLAMController:
-    """Simultaneous Localization and Mapping controller."""
+    """Full SLAM pipeline with loop closure and 3D point cloud."""
 
     def __init__(self, config: dict = None):
-        """
-        Args:
-            config: Configuration dictionary
-        """
-        self.logger = logging.getLogger(self.__class__.__name__)
-
-        # Load SLAM settings from config
         if config is None:
             config = {}
 
-        slam_settings = config.get("slam_settings", {})
-        map_size_m = slam_settings.get("map_size_m", 20.0)  # Increased from 10m
-        resolution_m = slam_settings.get("map_resolution_m", 0.05)
+        self.logger = logging.getLogger(self.__class__.__name__)
 
-        vo_settings = config.get("visual_odometry_settings", {})
-        camera_height = vo_settings.get("camera_height_m", 0.1)
-        camera_tilt = vo_settings.get("camera_tilt_deg", 20.0)
+        # ----------------------------------------------------------------
+        # Config sections
+        # ----------------------------------------------------------------
+        slam_cfg = config.get("slam_settings", {})
+        vo_cfg   = config.get("visual_odometry_settings", {})
+        path_cfg = config.get("path_planning_settings", {})
+        nav_cfg  = config.get("navigation_settings", {})
+        kf_cfg   = config.get("keyframe_settings", {})
+        lc_cfg   = config.get("loop_closure_settings", {})
+        pc_cfg   = config.get("point_cloud_settings", {})
+        srv_cfg  = config.get("map_server_settings", {})
 
-        path_settings = config.get("path_planning_settings", {})
-        nav_settings = config.get("navigation_settings", {})
+        map_size_m   = slam_cfg.get("map_size_m", 20.0)
+        resolution_m = slam_cfg.get("map_resolution_m", 0.05)
 
-        # Initialize components
+        # ----------------------------------------------------------------
+        # Core pose estimation
+        # ----------------------------------------------------------------
         self.visual_odometry = VisualOdometry(
-            camera_height_m=camera_height,
-            camera_tilt_deg=camera_tilt,
-            scale_calibration_factor=vo_settings.get("scale_calibration_factor", 1.0),
-            feature_count=vo_settings.get("feature_count", 500)
+            camera_height_m=vo_cfg.get("camera_height_m", 0.1),
+            camera_tilt_deg=vo_cfg.get("camera_tilt_deg", 20.0),
+            scale_calibration_factor=vo_cfg.get("scale_calibration_factor", 1.0),
+            feature_count=vo_cfg.get("feature_count", 500),
         )
 
+        # ----------------------------------------------------------------
+        # Keyframe database
+        # ----------------------------------------------------------------
+        self.keyframe_store = KeyframeStore(
+            min_distance_m=kf_cfg.get("min_distance_m", 0.3),
+            min_rotation_rad=kf_cfg.get("min_rotation_rad", 0.3),
+            max_keyframes=kf_cfg.get("max_keyframes", 500),
+            feature_count=kf_cfg.get("feature_count", 500),
+        )
+
+        # ----------------------------------------------------------------
+        # Loop closure
+        # ----------------------------------------------------------------
+        self.loop_detector = LoopClosureDetector(
+            min_score=lc_cfg.get("min_score", 0.25),
+            min_inliers=lc_cfg.get("min_inliers", 12),
+            min_age_frames=lc_cfg.get("min_age_frames", 10),
+            top_k_candidates=lc_cfg.get("top_k_candidates", 5),
+        )
+
+        # ----------------------------------------------------------------
+        # Pose graph
+        # ----------------------------------------------------------------
+        self.pose_graph = PoseGraph(
+            max_iterations=slam_cfg.get("pg_max_iterations", 100),
+            convergence_tol=slam_cfg.get("pg_convergence_tol", 1e-4),
+        )
+        # Seed the graph with the origin node (fixed)
+        self.pose_graph.add_node(0, Pose2D(0.0, 0.0, 0.0, time.time()), fixed=True)
+        self._pg_node_id = 0    # Most recent node in the pose graph
+
+        # ----------------------------------------------------------------
+        # 3D point cloud
+        # ----------------------------------------------------------------
+        self.point_cloud = PointCloudBuilder(
+            camera_height_m=vo_cfg.get("camera_height_m", 0.1),
+            camera_tilt_deg=vo_cfg.get("camera_tilt_deg", 20.0),
+            max_points=pc_cfg.get("max_points", 100_000),
+            subsample=pc_cfg.get("subsample", 8),
+        )
+
+        # ----------------------------------------------------------------
+        # 2D navigation map
+        # ----------------------------------------------------------------
         self.occupancy_grid = OccupancyGrid(
             width_m=map_size_m,
             height_m=map_size_m,
-            resolution_m=resolution_m
+            resolution_m=resolution_m,
         )
-
-        # Path planning and navigation
         self.path_planner = PathPlanner(
             self.occupancy_grid,
-            obstacle_inflation_radius=path_settings.get("obstacle_inflation_radius_m", 0.15),
-            occupancy_threshold=path_settings.get("occupancy_threshold", 0.65)
+            obstacle_inflation_radius=path_cfg.get("obstacle_inflation_radius_m", 0.15),
+            occupancy_threshold=path_cfg.get("occupancy_threshold", 0.65),
         )
         self.waypoint_navigator = WaypointNavigator(
-            position_tolerance_m=nav_settings.get("position_tolerance_m", 0.15),
-            heading_tolerance_deg=nav_settings.get("heading_tolerance_deg", 15.0)
+            position_tolerance_m=nav_cfg.get("position_tolerance_m", 0.15),
+            heading_tolerance_deg=nav_cfg.get("heading_tolerance_deg", 15.0),
         )
 
+        # ----------------------------------------------------------------
+        # Map server (host visualisation)
+        # ----------------------------------------------------------------
+        self._server_enabled = srv_cfg.get("enabled", False)
+        self.map_server: Optional[MapServer] = None
+        if self._server_enabled:
+            self.map_server = MapServer(
+                host=srv_cfg.get("host", "255.255.255.255"),
+                port=srv_cfg.get("port", 5005),
+                broadcast_hz=srv_cfg.get("broadcast_hz", 2.0),
+            )
+            self.map_server.start()
+
+        # ----------------------------------------------------------------
         # State
+        # ----------------------------------------------------------------
         self.initialized = False
-        self.last_map_update = 0.0
-        self.map_update_interval = 0.5  # Update map every 0.5s
+        self._last_map_update = 0.0
+        self._map_update_interval = slam_cfg.get("map_update_interval_s", 0.5)
+        self._last_cloud_update = 0.0
+        self._cloud_update_interval = pc_cfg.get("update_interval_s", 1.0)
         self.current_planned_path: Optional[List[Tuple[float, float]]] = None
 
-        self.logger.info("SLAM controller initialized with path planning")
+        # Corrected pose from pose graph (starts at origin)
+        self._corrected_pose = Pose2D(0.0, 0.0, 0.0, time.time())
 
-    def process_frame(self, image: np.ndarray,
-                     depth_map: Optional[DepthMap] = None,
-                     action_hint: Optional[str] = None) -> Tuple[Pose2D, np.ndarray]:
-        """Process a new frame with SLAM.
+        # Loop closure stats
+        self._loop_closures: List[dict] = []
+
+        self.logger.info("SLAM controller initialised (loop closure + 3D point cloud)")
+
+    # ------------------------------------------------------------------
+    # Main per-frame entry point
+    # ------------------------------------------------------------------
+
+    def process_frame(self,
+                      image: np.ndarray,
+                      depth_map: Optional[DepthMap] = None,
+                      action_hint: Optional[str] = None) -> Tuple[Pose2D, np.ndarray]:
+        """
+        Process one camera frame through the full SLAM pipeline.
 
         Args:
-            image: RGB or grayscale image
-            depth_map: Optional depth estimation
-            action_hint: Robot action taken (for scale estimation)
+            image: BGR or grayscale image from camera
+            depth_map: MiDaS depth map (optional but enables 3D mapping)
+            action_hint: Most recent robot action ('forward', 'turn_left', …)
 
         Returns:
-            (current_pose, map_visualization)
+            (corrected_pose, 2D_map_visualization)
         """
-        # Update visual odometry
-        motion = self.visual_odometry.process_frame(image, action_hint)
+        # ---- 1. Visual odometry ----------------------------------------
+        motion: Optional[MotionEstimate] = self.visual_odometry.process_frame(
+            image, action_hint
+        )
+        raw_pose = self.visual_odometry.get_pose()
 
-        # Get current pose estimate
-        pose = self.visual_odometry.get_pose()
+        # ---- 2. Pose graph — add odometry edge --------------------------
+        if motion is not None:
+            new_id = self._pg_node_id + 1
+            self.pose_graph.add_node(new_id, raw_pose)
+            dx = raw_pose.x - self._corrected_pose.x
+            dy = raw_pose.y - self._corrected_pose.y
+            dtheta = raw_pose.theta - self._corrected_pose.theta
+            self.pose_graph.add_odometry_edge(
+                self._pg_node_id, new_id, (dx, dy, dtheta)
+            )
+            self._pg_node_id = new_id
 
-        # Update map if enough time passed
+        # ---- 3. Keyframe + loop closure ---------------------------------
+        gray = image if len(image.shape) == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        new_kf = self.keyframe_store.try_add(gray, raw_pose)
+
+        if new_kf is not None:
+            closure = self.loop_detector.detect(new_kf, self.keyframe_store)
+            if closure is not None:
+                # Add loop edge to pose graph
+                from_pose = closure.query_kf.pose
+                to_pose   = closure.match_kf.pose
+                rel = (
+                    to_pose.x - from_pose.x,
+                    to_pose.y - from_pose.y,
+                    to_pose.theta - from_pose.theta,
+                )
+                self.pose_graph.add_loop_edge(
+                    closure.query_kf.id,
+                    closure.match_kf.id,
+                    rel,
+                    score=closure.score,
+                )
+
+                # Optimise and update corrected pose
+                corrected_poses = self.pose_graph.optimize()
+                if self._pg_node_id in corrected_poses:
+                    cp = corrected_poses[self._pg_node_id]
+                    self._corrected_pose = cp
+
+                # Log and broadcast the loop
+                event = {
+                    "from_kf": closure.query_kf.id,
+                    "to_kf": closure.match_kf.id,
+                    "score": round(closure.score, 3),
+                    "inliers": closure.num_inliers,
+                }
+                self._loop_closures.append(event)
+                self.logger.info(f"Loop closure confirmed: {event}")
+
+                if self.map_server:
+                    self.map_server.update_loop(from_pose, to_pose)
+
+        # ---- 4. Use corrected pose where available ----------------------
+        # Between loop closures, track raw odometry delta from last correction
+        if motion is not None:
+            self._corrected_pose = Pose2D(
+                self._corrected_pose.x + (raw_pose.x - self.visual_odometry.pose_history[-2].x
+                                          if len(self.visual_odometry.pose_history) > 1 else 0),
+                self._corrected_pose.y + (raw_pose.y - self.visual_odometry.pose_history[-2].y
+                                          if len(self.visual_odometry.pose_history) > 1 else 0),
+                raw_pose.theta,
+                raw_pose.timestamp,
+            )
+        pose = self._corrected_pose
+
+        # ---- 5. 3D point cloud ------------------------------------------
         now = time.time()
-        if now - self.last_map_update >= self.map_update_interval:
-            self._update_map(pose, depth_map)
-            self.last_map_update = now
+        if depth_map is not None and (now - self._last_cloud_update) >= self._cloud_update_interval:
+            depth_raw = depth_map.depth_map if hasattr(depth_map, 'depth_map') else None
+            if depth_raw is not None:
+                color_frame = image if len(image.shape) == 3 else None
+                added = self.point_cloud.add_frame(depth_raw, pose, color_frame)
+                self.logger.debug(f"Point cloud: +{added} points (total={self.point_cloud.point_count()})")
+            self._last_cloud_update = now
 
-        # Generate map visualization
-        map_vis = self.occupancy_grid.get_visualization(robot_pose=pose)
+        # ---- 6. 2D occupancy grid ---------------------------------------
+        if (now - self._last_map_update) >= self._map_update_interval:
+            self._update_occupancy(pose, depth_map)
+            self._last_map_update = now
+
+        # ---- 7. Broadcast to host ---------------------------------------
+        if self.map_server:
+            self.map_server.update_pose(pose)
+            if self.point_cloud.point_count() > 0:
+                self.map_server.update_cloud(self.point_cloud.get_cloud())
 
         if not self.initialized:
             self.initialized = True
-            self.logger.info("SLAM initialized with first frame")
+            self.logger.info("SLAM initialised with first frame")
 
+        map_vis = self.get_map_visualization(
+            include_trajectory=True, include_planned_path=True
+        )
         return pose, map_vis
 
-    def _update_map(self, pose: Pose2D, depth_map: Optional[DepthMap]) -> None:
-        """Update occupancy grid with current observations.
+    # ------------------------------------------------------------------
+    # Occupancy grid update
+    # ------------------------------------------------------------------
 
-        Args:
-            pose: Current robot pose
-            depth_map: Depth estimation (if available)
-        """
-        # Mark robot's current position
+    def _update_occupancy(self, pose: Pose2D, depth_map: Optional[DepthMap]) -> None:
         self.occupancy_grid.mark_robot_position(pose, radius_m=0.15)
 
-        # Update map using depth information
-        if depth_map:
-            depths = depth_map.get_directional_depths()
+        # Feed from point cloud obstacle mask when available
+        if self.point_cloud.point_count() > 50:
+            mask = self.point_cloud.get_obstacle_mask(
+                grid_size_m=self.occupancy_grid.width_m,
+                resolution_m=self.occupancy_grid.resolution_m,
+            )
+            # Stamp obstacle cells directly into the log-odds grid
+            gx_off = self.occupancy_grid.origin_x
+            gy_off = self.occupancy_grid.origin_y
+            ys, xs = np.where(mask)
+            for gx, gy in zip(xs, ys):
+                if self.occupancy_grid.is_valid_cell(gx, gy):
+                    self.occupancy_grid.grid[gy, gx] = min(
+                        self.occupancy_grid.grid[gy, gx] + self.occupancy_grid.log_odds_occupied,
+                        self.occupancy_grid.log_odds_max,
+                    )
+            return
 
-            # Convert depth values to distances (0=close, 1=far)
-            # Map to real distances (approximate)
-            def depth_to_distance(d: float) -> float:
-                return 0.1 + d * 1.9  # 0.1m to 2.0m range
+        # Fallback to directional depth (original behaviour)
+        if depth_map is None:
+            return
 
-            # Front sensor
-            front_dist = depth_to_distance(depths['front'])
-            if depths['front'] < 0.3:  # Close obstacle
-                self.occupancy_grid.update_obstacle(pose, front_dist, bearing_rad=0.0)
-            else:  # Free space
-                self.occupancy_grid.update_free_space(pose, max_range_m=2.0, bearing_rad=0.0)
+        depths = depth_map.get_directional_depths()
 
-            # Left sensor
-            left_dist = depth_to_distance(depths['left'])
-            if depths['left'] < 0.3:
-                self.occupancy_grid.update_obstacle(pose, left_dist, bearing_rad=np.pi/4)
+        def dist(d: float) -> float:
+            return 0.1 + d * 1.9
+
+        for bearing, key in ((0.0, 'front'), (np.pi / 4, 'left'), (-np.pi / 4, 'right')):
+            d = depths[key]
+            if d < 0.3:
+                self.occupancy_grid.update_obstacle(pose, dist(d), bearing)
             else:
-                self.occupancy_grid.update_free_space(pose, max_range_m=2.0, bearing_rad=np.pi/4)
+                self.occupancy_grid.update_free_space(pose, 2.0, bearing)
 
-            # Right sensor
-            right_dist = depth_to_distance(depths['right'])
-            if depths['right'] < 0.3:
-                self.occupancy_grid.update_obstacle(pose, right_dist, bearing_rad=-np.pi/4)
-            else:
-                self.occupancy_grid.update_free_space(pose, max_range_m=2.0, bearing_rad=-np.pi/4)
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
 
     def get_current_pose(self) -> Pose2D:
-        """Get current robot pose estimate."""
-        return self.visual_odometry.get_pose()
+        return self._corrected_pose
 
     def get_trajectory(self) -> List[Pose2D]:
-        """Get full trajectory history."""
-        return self.visual_odometry.get_trajectory()
-
-    def get_map_visualization(self, include_trajectory: bool = False,
-                            include_planned_path: bool = True) -> np.ndarray:
-        """Get map visualization with optional trajectory and path overlay.
-
-        Args:
-            include_trajectory: If True, draw full trajectory on map
-            include_planned_path: If True, draw planned path on map
-
-        Returns:
-            RGB visualization
-        """
-        pose = self.visual_odometry.get_pose()
-        map_vis = self.occupancy_grid.get_visualization(robot_pose=pose)
-
-        if include_trajectory and len(self.visual_odometry.pose_history) > 1:
-            # Draw trajectory (blue)
-            for i in range(len(self.visual_odometry.pose_history) - 1):
-                p1 = self.visual_odometry.pose_history[i]
-                p2 = self.visual_odometry.pose_history[i + 1]
-
-                gx1, gy1 = self.occupancy_grid.world_to_grid(p1.x, p1.y)
-                gx2, gy2 = self.occupancy_grid.world_to_grid(p2.x, p2.y)
-
-                # Flip y for visualization
-                gy1_vis = self.occupancy_grid.grid_height - gy1
-                gy2_vis = self.occupancy_grid.grid_height - gy2
-
-                cv2.line(map_vis, (gx1, gy1_vis), (gx2, gy2_vis), (255, 0, 0), 1)
-
-        if include_planned_path and self.current_planned_path:
-            # Draw planned path (green)
-            for i in range(len(self.current_planned_path) - 1):
-                x1, y1 = self.current_planned_path[i]
-                x2, y2 = self.current_planned_path[i + 1]
-
-                gx1, gy1 = self.occupancy_grid.world_to_grid(x1, y1)
-                gx2, gy2 = self.occupancy_grid.world_to_grid(x2, y2)
-
-                # Flip y for visualization
-                gy1_vis = self.occupancy_grid.grid_height - gy1
-                gy2_vis = self.occupancy_grid.grid_height - gy2
-
-                cv2.line(map_vis, (gx1, gy1_vis), (gx2, gy2_vis), (0, 255, 0), 2)
-
-            # Draw waypoints as green circles
-            for x, y in self.current_planned_path:
-                gx, gy = self.occupancy_grid.world_to_grid(x, y)
-                gy_vis = self.occupancy_grid.grid_height - gy
-                cv2.circle(map_vis, (gx, gy_vis), 2, (0, 255, 0), -1)
-
-        return map_vis
+        return self.pose_graph.get_trajectory()
 
     def find_exploration_targets(self, num_targets: int = 3) -> List[Tuple[float, float]]:
-        """Find promising locations to explore (frontiers).
-
-        Args:
-            num_targets: Number of targets to return
-
-        Returns:
-            List of (x_m, y_m) target locations
-        """
         frontiers = self.occupancy_grid.find_frontiers()
-
         if not frontiers:
             return []
-
-        # Sort frontiers by distance from robot
-        pose = self.visual_odometry.get_pose()
-        frontiers_with_dist = []
-
-        for fx, fy in frontiers:
-            dist = np.sqrt((fx - pose.x)**2 + (fy - pose.y)**2)
-            frontiers_with_dist.append((dist, fx, fy))
-
-        frontiers_with_dist.sort()
-
-        # Return closest frontiers (skip very close ones)
-        targets = []
-        for dist, fx, fy in frontiers_with_dist:
-            if dist > 0.3 and len(targets) < num_targets:  # At least 30cm away
-                targets.append((fx, fy))
-
-        return targets
+        pose = self._corrected_pose
+        by_dist = sorted(
+            frontiers,
+            key=lambda p: (p[0] - pose.x) ** 2 + (p[1] - pose.y) ** 2
+        )
+        return [(fx, fy) for fx, fy in by_dist if
+                (fx - pose.x) ** 2 + (fy - pose.y) ** 2 > 0.09][:num_targets]
 
     def get_navigation_waypoint(self) -> Optional[Tuple[float, float]]:
-        """Get next waypoint for exploration.
-
-        Returns:
-            (x_m, y_m) waypoint or None
-        """
         targets = self.find_exploration_targets(num_targets=1)
         return targets[0] if targets else None
 
     def plan_path_to_goal(self, goal_x: float, goal_y: float) -> Optional[List[Tuple[float, float]]]:
-        """Plan a path to goal coordinates.
-
-        Args:
-            goal_x, goal_y: Goal position in meters
-
-        Returns:
-            List of waypoints or None if no path found
-        """
-        current_pose = self.visual_odometry.get_pose()
-        path = self.path_planner.plan_path(current_pose, goal_x, goal_y)
-
+        path = self.path_planner.plan_path(self._corrected_pose, goal_x, goal_y)
         if path:
             self.current_planned_path = path
             self.waypoint_navigator.set_path(path)
-            self.logger.info(f"Planned path to ({goal_x:.2f}, {goal_y:.2f}) with {len(path)} waypoints")
+            self.logger.info(f"Path to ({goal_x:.2f}, {goal_y:.2f}): {len(path)} waypoints")
         else:
-            self.logger.warning(f"Could not find path to ({goal_x:.2f}, {goal_y:.2f})")
-
+            self.logger.warning(f"No path found to ({goal_x:.2f}, {goal_y:.2f})")
         return path
 
     def get_navigation_command(self, obstacle_detected: bool = False) -> Optional[NavigationCommand]:
-        """Get next navigation command for waypoint following.
-
-        Args:
-            obstacle_detected: Whether obstacle is currently blocking
-
-        Returns:
-            NavigationCommand or None if not navigating
-        """
         if not self.waypoint_navigator.is_active():
             return None
-
-        current_pose = self.visual_odometry.get_pose()
-        return self.waypoint_navigator.get_next_command(current_pose, obstacle_detected)
+        return self.waypoint_navigator.get_next_command(self._corrected_pose, obstacle_detected)
 
     def is_navigating(self) -> bool:
-        """Check if currently following a planned path."""
         return self.waypoint_navigator.is_active()
 
     def get_navigation_progress(self) -> dict:
-        """Get navigation progress information."""
         return self.waypoint_navigator.get_progress()
 
     def cancel_navigation(self) -> None:
-        """Cancel current navigation."""
         self.waypoint_navigator.reset()
         self.current_planned_path = None
-        self.logger.info("Navigation cancelled")
+
+    # ------------------------------------------------------------------
+    # Visualisation
+    # ------------------------------------------------------------------
+
+    def get_map_visualization(self,
+                               include_trajectory: bool = False,
+                               include_planned_path: bool = True) -> np.ndarray:
+        pose = self._corrected_pose
+        vis = self.occupancy_grid.get_visualization(robot_pose=pose)
+
+        if include_trajectory:
+            traj = self.pose_graph.get_trajectory()
+            for i in range(len(traj) - 1):
+                p1, p2 = traj[i], traj[i + 1]
+                gx1, gy1 = self.occupancy_grid.world_to_grid(p1.x, p1.y)
+                gx2, gy2 = self.occupancy_grid.world_to_grid(p2.x, p2.y)
+                gy1v = self.occupancy_grid.grid_height - gy1
+                gy2v = self.occupancy_grid.grid_height - gy2
+                cv2.line(vis, (gx1, gy1v), (gx2, gy2v), (255, 100, 0), 1)
+
+            # Draw loop closure arcs
+            for lc in self._loop_closures:
+                kf_from = self.keyframe_store.get_by_id(lc["from_kf"])
+                kf_to   = self.keyframe_store.get_by_id(lc["to_kf"])
+                if kf_from and kf_to:
+                    gx1, gy1 = self.occupancy_grid.world_to_grid(kf_from.pose.x, kf_from.pose.y)
+                    gx2, gy2 = self.occupancy_grid.world_to_grid(kf_to.pose.x, kf_to.pose.y)
+                    gy1v = self.occupancy_grid.grid_height - gy1
+                    gy2v = self.occupancy_grid.grid_height - gy2
+                    cv2.line(vis, (gx1, gy1v), (gx2, gy2v), (0, 0, 255), 1)  # Red = loop closure
+
+        if include_planned_path and self.current_planned_path:
+            for i in range(len(self.current_planned_path) - 1):
+                x1, y1 = self.current_planned_path[i]
+                x2, y2 = self.current_planned_path[i + 1]
+                gx1, gy1 = self.occupancy_grid.world_to_grid(x1, y1)
+                gx2, gy2 = self.occupancy_grid.world_to_grid(x2, y2)
+                gy1v = self.occupancy_grid.grid_height - gy1
+                gy2v = self.occupancy_grid.grid_height - gy2
+                cv2.line(vis, (gx1, gy1v), (gx2, gy2v), (0, 255, 0), 2)
+
+        return vis
+
+    # ------------------------------------------------------------------
+    # Stats / persistence
+    # ------------------------------------------------------------------
 
     def get_statistics(self) -> dict:
-        """Get SLAM statistics."""
-        vo_stats = self.visual_odometry.get_statistics()
-        map_stats = self.occupancy_grid.get_statistics()
-
         return {
-            'slam': {
-                'initialized': self.initialized,
-                'current_pose': str(self.visual_odometry.get_pose())
+            "slam": {
+                "initialized": self.initialized,
+                "current_pose": str(self._corrected_pose),
+                "loop_closures": len(self._loop_closures),
+                "pose_graph_nodes": self.pose_graph.node_count(),
+                "pose_graph_edges": self.pose_graph.edge_count(),
             },
-            'odometry': vo_stats,
-            'map': map_stats
+            "keyframes": len(self.keyframe_store),
+            "point_cloud": {
+                "points": self.point_cloud.point_count(),
+            },
+            "odometry": self.visual_odometry.get_statistics(),
+            "map": self.occupancy_grid.get_statistics(),
         }
 
+    def save_map(self, filepath: str) -> None:
+        vis = self.get_map_visualization(include_trajectory=True)
+        cv2.imwrite(filepath, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+        self.logger.info(f"Map saved to {filepath}")
+
     def reset(self) -> None:
-        """Reset SLAM system."""
         self.visual_odometry.reset()
+        self.keyframe_store.keyframes.clear()
+        self.loop_detector.total_closures = 0
+        self.pose_graph.__init__()
+        self.pose_graph.add_node(0, Pose2D(0.0, 0.0, 0.0, time.time()), fixed=True)
+        self._pg_node_id = 0
+        self.point_cloud.reset()
         self.occupancy_grid = OccupancyGrid(
             width_m=self.occupancy_grid.width_m,
             height_m=self.occupancy_grid.height_m,
-            resolution_m=self.occupancy_grid.resolution_m
+            resolution_m=self.occupancy_grid.resolution_m,
         )
+        self._corrected_pose = Pose2D(0.0, 0.0, 0.0, time.time())
+        self._loop_closures.clear()
         self.initialized = False
         self.logger.info("SLAM system reset")
 
-    def save_map(self, filepath: str) -> None:
-        """Save current map visualization to file.
-
-        Args:
-            filepath: Path to save image
-        """
-        map_vis = self.get_map_visualization(include_trajectory=True)
-        cv2.imwrite(filepath, cv2.cvtColor(map_vis, cv2.COLOR_RGB2BGR))
-        self.logger.info(f"Map saved to {filepath}")
+    def __del__(self) -> None:
+        if self.map_server:
+            self.map_server.stop()
