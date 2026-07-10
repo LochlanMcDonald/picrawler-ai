@@ -9,7 +9,7 @@ from typing import Deque, Dict, List, Optional, Tuple, Union
 
 from ai.vision_ai import AIVisionSystem
 from core.robot_controller import RobotController
-from vision.camera import CameraSystem
+from vision.camera import CameraSystem, CameraPanicException
 from voice.voice_system import VoiceSystem
 
 ActionChoice = Union[str, Tuple[str, float]]  # ("action", duration_override_s)
@@ -96,6 +96,10 @@ class BaseBehavior:
         self._escape_strikes = 0
         self._max_strikes_before_reset = int(bl.get("escape_strikes_reset", 6))
 
+        # Track consecutive obstacle overrides to prevent stuck loops
+        self._consecutive_obstacle_overrides = 0
+        self._max_obstacle_overrides = int(bl.get("max_obstacle_overrides_before_escape", 3))
+
         # per-tick control note for thought narration
         self._last_control_note: str = ""
 
@@ -158,6 +162,53 @@ class BaseBehavior:
     def postprocess_action(self, action: str, *, analysis=None, **_ignored) -> ActionChoice:
         self._last_control_note = ""
 
+        # PRIORITY 1: Check ultrasonic sensor for obstacles (SAFETY OVERRIDE)
+        if action in ("forward", "ahead"):
+            obstacle_info = self.robot.get_obstacle_info()
+            if obstacle_info["has_obstacle"]:
+                distance = obstacle_info["distance_cm"]
+                threshold = obstacle_info["threshold_cm"]
+
+                # Track consecutive overrides - if too many, we're stuck!
+                self._consecutive_obstacle_overrides += 1
+
+                self.logger.warning(
+                    f"ULTRASONIC OVERRIDE #{self._consecutive_obstacle_overrides}: "
+                    f"Obstacle at {distance:.1f}cm < {threshold}cm - preventing forward"
+                )
+
+                # If we've overridden too many times, we're stuck in a loop!
+                if self._consecutive_obstacle_overrides >= self._max_obstacle_overrides:
+                    self.logger.error(
+                        f"Stuck in obstacle loop ({self._consecutive_obstacle_overrides} consecutive overrides) - "
+                        "triggering escape sequence and banning forward"
+                    )
+                    self._narrate("I'm stuck. Trying to escape.", level="normal", force=True)
+                    # Ban forward to force different behavior
+                    self._ban("forward")
+                    self._consecutive_obstacle_overrides = 0  # Reset counter
+                    self._last_control_note = f"obstacle loop -> escape"
+                    return self._escape(action, reason="obstacle_loop")
+
+                # Voice feedback
+                self._narrate(f"Obstacle detected. Turning.", level="normal")
+
+                # Choose turn direction pseudo-randomly to avoid getting stuck
+                import random
+                new_action = random.choice(["turn_left", "turn_right"])
+                self._last_control_note = f"obstacle {distance:.1f}cm ({self._consecutive_obstacle_overrides}) -> {new_action}"
+                # Track this executed action
+                self._recent_actions.append(new_action)
+                return (new_action, 0.8)  # Moderate turn duration
+            else:
+                # Successfully moving forward without obstacle - reset counter
+                if self._consecutive_obstacle_overrides > 0:
+                    self.logger.info(
+                        f"Obstacle cleared! Resetting override counter (was {self._consecutive_obstacle_overrides})"
+                    )
+                    self._consecutive_obstacle_overrides = 0
+
+        # Track the requested action for normal anti-loop detection
         if action:
             self._recent_actions.append(action)
 
@@ -366,6 +417,10 @@ class BaseBehavior:
         capture_interval = float(self.config.get("camera_settings", {}).get("capture_interval_s", 2.5))
         last_capture = 0.0
 
+        # Circuit breaker for camera failures
+        consecutive_camera_failures = 0
+        max_consecutive_failures = 5
+
         while time.time() < end_t:
             now = time.time()
             if now - last_capture < capture_interval:
@@ -373,15 +428,38 @@ class BaseBehavior:
                 continue
 
             last_capture = now
-            _pil, b64, path = self.camera.capture(
-                save=bool(self.config.get("logging_settings", {}).get("save_images", True))
-            )
-            if b64 is None:
-                self.logger.warning("No camera frame; stopping")
-                self._narrate("Stopping.", level="normal")
-                self._think("No camera frame. Executing stop for safety.", force=True)
-                self.robot.execute("stop", 0.3)
-                time.sleep(0.5)
+
+            # Attempt camera capture with panic detection and circuit breaker
+            try:
+                _pil, b64, path = self.camera.capture(
+                    save=bool(self.config.get("logging_settings", {}).get("save_images", True))
+                )
+                if b64 is None:
+                    consecutive_camera_failures += 1
+                    self.logger.warning(f"No camera frame (failure {consecutive_camera_failures}/{max_consecutive_failures})")
+
+                    # Circuit breaker: stop if too many consecutive failures
+                    if consecutive_camera_failures >= max_consecutive_failures:
+                        self.logger.error("Camera circuit breaker triggered - too many consecutive failures")
+                        self._narrate("Camera system failure. Stopping.", level="normal", force=True)
+                        self.robot.execute("stop", 0.3)
+                        break
+
+                    self._narrate("Stopping.", level="normal")
+                    self._think("No camera frame. Executing stop for safety.", force=True)
+                    self.robot.execute("stop", 0.3)
+                    time.sleep(0.5)
+                    continue
+                else:
+                    # Reset failure counter on success
+                    consecutive_camera_failures = 0
+
+            except CameraPanicException as e:
+                # Panic detection triggered - emergency stop
+                self.logger.warning(f"Camera panic: {e}")
+                self.robot.execute("stop", 0.5)
+                # Wait longer before continuing after panic
+                time.sleep(2.0)
                 continue
 
             analysis = self.ai.analyze_scene(b64, context=self.context())
@@ -389,11 +467,15 @@ class BaseBehavior:
             if getattr(analysis, "description", "") in {"AI unavailable", "AI error"}:
                 self._narrate("I can't reach my AI right now. Stopping.", level="normal", force=True)
 
+            # Get obstacle info for AI decision making
+            obstacle_info = self.robot.get_obstacle_info()
+
             decision = self.ai.decide_action(
                 analysis=analysis,
                 mode=self.name,
                 available_actions=self.available_actions(),
                 target=self.target,
+                obstacle_info=obstacle_info,
             )
 
             raw_action = str(decision.get("action", "stop"))
@@ -418,6 +500,7 @@ class BaseBehavior:
                 force=self._thoughts_force_each_tick,
             )
 
+            # Use same obstacle_info from decision making (no need to call twice)
             record = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "mode": self.name,
@@ -430,6 +513,7 @@ class BaseBehavior:
                     "suggested_actions": getattr(analysis, "suggested_actions", []),
                     "processing_time_s": getattr(analysis, "processing_time_s", 0.0),
                 },
+                "obstacle": obstacle_info,
                 "decision": decision,
                 "raw_action": raw_action,
                 "raw_duration_s": raw_duration_s,
@@ -445,8 +529,17 @@ class BaseBehavior:
 
             if self.verbose:
                 self.logger.info(f"Seen: {getattr(analysis, 'description', '')}")
+                if obstacle_info["sensor_available"]:
+                    self.logger.info(
+                        f"Obstacle: {obstacle_info['distance_cm']:.1f}cm "
+                        f"(threshold: {obstacle_info['threshold_cm']}cm, "
+                        f"detected: {obstacle_info['has_obstacle']}, "
+                        f"override_count: {self._consecutive_obstacle_overrides})"
+                    )
+                else:
+                    self.logger.info("Obstacle: Sensor not available (vision-only mode)")
                 self.logger.info(f"Decision: {decision}")
-                self.logger.info(f"Executing: {action} ({duration_s:.2f}s) | note={self._last_control_note}")
+                self.logger.info(f"Raw→Executed: {raw_action}→{action} ({duration_s:.2f}s) | note={self._last_control_note}")
 
             # Short narration (optional / still throttled)
             if action == "forward":
