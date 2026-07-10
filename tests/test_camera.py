@@ -1,6 +1,7 @@
 """Tests for camera panic detection (no camera hardware required)."""
 
 import logging
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -71,3 +72,107 @@ def test_threshold_boundary(dummy_voice):
 def test_capture_raises_panic_exception_is_exported():
     # BaseBehavior imports and catches this type; keep it stable.
     assert issubclass(CameraPanicException, Exception)
+
+
+# ---------------------------------------------------------------- capture
+
+
+import base64
+
+import numpy as np
+
+
+class FakePicam2:
+    def __init__(self, array):
+        self.array = array
+        self.stopped = False
+
+    def capture_array(self):
+        if isinstance(self.array, Exception):
+            raise self.array
+        return self.array
+
+    def stop(self):
+        self.stopped = True
+
+
+class FakeCv:
+    def __init__(self):
+        self.released = False
+
+    def release(self):
+        self.released = True
+
+
+def half_and_half():
+    """Left half black, right half white."""
+    a = np.zeros((32, 32, 3), dtype=np.uint8)
+    a[:, 16:, :] = 255
+    return a
+
+
+def make_capture_camera(tmp_path, dummy_voice, *, picam=None, cv=None, flip_h=False, flip_v=False, enable_panic=False):
+    cam = make_camera(dummy_voice, enable_panic=enable_panic)
+    cam.quality = 85
+    cam.flip_h = flip_h
+    cam.flip_v = flip_v
+    cam.save_dir = tmp_path / "images"
+    cam.save_dir.mkdir(parents=True, exist_ok=True)
+    cam._picam2 = picam
+    cam._cv = cv
+    return cam
+
+
+def test_capture_without_backend_returns_nones(tmp_path, dummy_voice):
+    cam = make_capture_camera(tmp_path, dummy_voice)
+    assert cam.capture() == (None, None, None)
+
+
+def test_capture_encodes_jpeg_and_saves(tmp_path, dummy_voice):
+    cam = make_capture_camera(tmp_path, dummy_voice, picam=FakePicam2(half_and_half()))
+    img, b64, path = cam.capture(save=True)
+    assert img.size == (32, 32)
+    raw = base64.b64decode(b64)
+    assert raw[:2] == b"\xff\xd8"  # JPEG magic bytes
+    assert Path(path).exists()
+    assert Path(path).read_bytes() == raw
+
+
+def test_capture_save_false_writes_nothing(tmp_path, dummy_voice):
+    cam = make_capture_camera(tmp_path, dummy_voice, picam=FakePicam2(half_and_half()))
+    _, b64, path = cam.capture(save=False)
+    assert b64 is not None
+    assert path is None
+    assert list(cam.save_dir.iterdir()) == []
+
+
+def test_capture_flip_h(tmp_path, dummy_voice):
+    cam = make_capture_camera(tmp_path, dummy_voice, picam=FakePicam2(half_and_half()), flip_h=True)
+    img, _, _ = cam.capture(save=False)
+    # Originally left is black; after horizontal flip it's white
+    assert img.getpixel((0, 0)) == (255, 255, 255)
+    assert img.getpixel((31, 0)) == (0, 0, 0)
+
+
+def test_capture_backend_failure_returns_nones(tmp_path, dummy_voice):
+    cam = make_capture_camera(tmp_path, dummy_voice, picam=FakePicam2(RuntimeError("bus error")))
+    assert cam.capture() == (None, None, None)
+
+
+def test_capture_raises_on_panic(tmp_path, dummy_voice):
+    black = np.zeros((32, 32, 3), dtype=np.uint8)
+    white = np.full((32, 32, 3), 255, dtype=np.uint8)
+    cam = make_capture_camera(tmp_path, dummy_voice, picam=FakePicam2(black), enable_panic=True)
+    cam.capture(save=False)  # primes _prev_image
+    cam._picam2.array = white
+    with pytest.raises(CameraPanicException):
+        cam.capture(save=False)
+
+
+def test_close_releases_backends(tmp_path, dummy_voice):
+    picam = FakePicam2(half_and_half())
+    cv = FakeCv()
+    cam = make_capture_camera(tmp_path, dummy_voice, picam=picam, cv=cv)
+    cam.close()
+    assert picam.stopped is True
+    assert cv.released is True
