@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -30,13 +31,17 @@ class AIVisionSystem:
     # Default throttle (seconds); can be overridden via config or main.py
     MIN_SECONDS_BETWEEN_CALLS: float = 3.0
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, voice: Optional[VoiceSystem] = None):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.config = config  # keep for dialogue/personality access
 
-        api_key = config.get("openai_api_key") or None
-        # Also allow OPENAI_API_KEY env var automatically via SDK
-        self.client = OpenAI(api_key=None if (api_key in (None, "", "your-api-key-here")) else api_key)
+        # Prefer config key, fall back to OPENAI_API_KEY env var. Use a
+        # placeholder when neither is set so construction never crashes;
+        # API calls will then fail and be handled by the safe fallbacks.
+        api_key = config.get("openai_api_key")
+        if api_key in (None, "", "your-api-key-here"):
+            api_key = os.getenv("OPENAI_API_KEY") or "missing-api-key"
+        self.client = OpenAI(api_key=api_key)
 
         ai = config.get("ai_settings", {})
         self.model = ai.get("model", "gpt-4.1-mini")
@@ -53,8 +58,9 @@ class AIVisionSystem:
             ai.get("min_seconds_between_calls", self.MIN_SECONDS_BETWEEN_CALLS)
         )
 
-        # Voice system (safe: will no-op if disabled or if TTS fails)
-        self.voice = VoiceSystem(config)
+        # Voice system (safe: will no-op if disabled or if TTS fails).
+        # Prefer a shared instance so cooldown/dedupe apply across subsystems.
+        self.voice = voice if voice is not None else VoiceSystem(config)
 
         # Failure narration suppression
         vs = config.get("voice_settings", {}) if isinstance(config, dict) else {}
@@ -319,13 +325,6 @@ class AIVisionSystem:
             return ""
 
         dedupe_window_s = float(vs.get("dialogue_dedupe_window_s", 30.0))
-        if (
-            self._last_dialogue_text
-            and (now - self._last_dialogue_text_at) < dedupe_window_s
-            and self._last_dialogue_text.strip()
-        ):
-            # we still allow new dialogue; dedupe check below prevents exact repeats
-            pass
 
         # Personality (simple, explicit, editable)
         personality = self.config.get("personality_settings", {}) if isinstance(self.config, dict) else {}
