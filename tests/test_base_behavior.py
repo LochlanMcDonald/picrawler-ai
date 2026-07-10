@@ -171,6 +171,16 @@ def test_repeated_obstacle_overrides_trigger_escape_and_ban(behavior, monkeypatc
     assert behavior._consecutive_obstacle_overrides == 0
 
 
+def test_override_counter_resets_when_path_clears(behavior, monkeypatch):
+    monkeypatch.setattr(bb.random, "choice", lambda seq: seq[0])
+    behavior.robot.obstacle = True
+    behavior.postprocess_action("forward", analysis=scene())
+    assert behavior._consecutive_obstacle_overrides == 1
+    behavior.robot.obstacle = False
+    behavior.postprocess_action("forward", analysis=scene("different view"))
+    assert behavior._consecutive_obstacle_overrides == 0
+
+
 def test_override_counter_resets_on_other_action(behavior, monkeypatch):
     monkeypatch.setattr(bb.random, "choice", lambda seq: seq[0])
     behavior.robot.obstacle = True

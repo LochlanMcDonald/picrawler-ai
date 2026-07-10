@@ -1,0 +1,29 @@
+{
+  "openai_api_key": "your-api-key-here",
+  "ai_settings": {
+    "model": "gpt-4o-mini",
+    "temperature": 0.4,
+    "request_timeout_s": 30
+  },
+  "robot_settings": {
+    "movement_speed": 50,
+    "turn_speed": 45,
+    "step_delay": 0.05,
+    "obstacle_distance_threshold_cm": 20,
+    "dry_run_if_no_hardware": true
+  },
+  "camera_settings": {
+    "resolution": [640, 480],
+    "capture_interval_s": 2.5,
+    "image_quality": 85,
+    "flip_h": false,
+    "flip_v": false,
+    "panic_on_visual_change": true,
+    "panic_change_threshold": 35.0
+  },
+  "logging_settings": {
+    "log_level": "INFO",
+    "save_images": false,
+    "save_decisions": true
+  }
+}

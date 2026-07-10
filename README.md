@@ -77,6 +77,7 @@ Tests run automatically in CI on every push.
 python utils/check_camera.py
 python utils/check_ai.py
 python utils/check_motors.py
+python utils/check_ultrasonic.py
 ```
 
 ## Manual gait tooling (optional)
