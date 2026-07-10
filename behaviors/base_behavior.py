@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from collections import deque
 from pathlib import Path
@@ -27,6 +28,7 @@ class BaseBehavior:
         duration_minutes: float,
         target: Optional[str] = None,
         verbose: bool = False,
+        voice: Optional[VoiceSystem] = None,
     ):
         self.config = config
         self.robot = robot
@@ -39,8 +41,9 @@ class BaseBehavior:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.decisions_path = Path("logs") / "decisions.jsonl"
 
-        # Voice system (safe: no-op if disabled)
-        self.voice = VoiceSystem(config)
+        # Voice system (safe: no-op if disabled). Reuse the AI's instance when
+        # none is provided so cooldown/dedupe apply across subsystems.
+        self.voice = voice if voice is not None else (getattr(ai, "voice", None) or VoiceSystem(config))
 
         vs = config.get("voice_settings", {}) if isinstance(config, dict) else {}
 
@@ -194,12 +197,18 @@ class BaseBehavior:
                 self._narrate(f"Obstacle detected. Turning.", level="normal")
 
                 # Choose turn direction pseudo-randomly to avoid getting stuck
-                import random
                 new_action = random.choice(["turn_left", "turn_right"])
                 self._last_control_note = f"obstacle {distance:.1f}cm ({self._consecutive_obstacle_overrides}) -> {new_action}"
                 # Track this executed action
                 self._recent_actions.append(new_action)
                 return (new_action, 0.8)  # Moderate turn duration
+
+            elif self._consecutive_obstacle_overrides > 0:
+                # Moving forward with a clear path again - the override streak is over
+                self.logger.info(
+                    f"Obstacle cleared! Resetting override counter (was {self._consecutive_obstacle_overrides})"
+                )
+                self._consecutive_obstacle_overrides = 0
 
         # Reset obstacle override counter if we're not being overridden
         if action not in ("forward", "ahead"):
@@ -260,9 +269,10 @@ class BaseBehavior:
     def _escape(self, stuck_action: str, *, reason: str) -> ActionChoice:
         now = time.time()
 
-        # Cooldown: don't re-escape every tick
+        # Cooldown: don't re-escape every tick. Never answer a stuck 'forward'
+        # with more forward — back away from whatever we're stuck on.
         if (now - self._last_escape_at) < self._escape_cooldown_s:
-            if stuck_action in ("turn_left", "turn_right"):
+            if stuck_action in ("turn_left", "turn_right", "forward", "ahead"):
                 self._last_control_note = (self._last_control_note + " | " if self._last_control_note else "") + "escape cooldown -> backward"
                 return ("backward", 1.2)
             self._last_control_note = (self._last_control_note + " | " if self._last_control_note else "") + "escape cooldown -> forward"
@@ -396,10 +406,7 @@ class BaseBehavior:
         ]
         if reasoning:
             parts.append(f"Why: {reasoning}")
-        if executed_action != raw_action or note:
-            parts.append(f"Exec: {executed_action} {duration_s:.1f}s")
-        else:
-            parts.append(f"Exec: {executed_action} {duration_s:.1f}s")
+        parts.append(f"Exec: {executed_action} {duration_s:.1f}s")
         if note:
             parts.append(f"Control: {note}")
         return " | ".join(parts)
@@ -464,7 +471,12 @@ class BaseBehavior:
             analysis = self.ai.analyze_scene(b64, context=self.context())
 
             if getattr(analysis, "description", "") in {"AI unavailable", "AI error"}:
-                self._narrate("I can't reach my AI right now. Stopping.", level="normal", force=True)
+                # Don't burn another (doomed) API call on decide_action —
+                # stop in place and wait for the next tick.
+                self._narrate("I can't reach my AI right now. Stopping.", level="normal")
+                self.robot.execute("stop", 0.3)
+                time.sleep(1.0)
+                continue
 
             # Get obstacle info for AI decision making
             obstacle_info = self.robot.get_obstacle_info()
@@ -529,9 +541,16 @@ class BaseBehavior:
             if self.verbose:
                 self.logger.info(f"Seen: {getattr(analysis, 'description', '')}")
                 if obstacle_info["sensor_available"]:
-                    self.logger.info(f"Obstacle: {obstacle_info['distance_cm']:.1f}cm (threshold: {obstacle_info['threshold_cm']}cm, detected: {obstacle_info['has_obstacle']})")
+                    self.logger.info(
+                        f"Obstacle: {obstacle_info['distance_cm']:.1f}cm "
+                        f"(threshold: {obstacle_info['threshold_cm']}cm, "
+                        f"detected: {obstacle_info['has_obstacle']}, "
+                        f"override_count: {self._consecutive_obstacle_overrides})"
+                    )
+                else:
+                    self.logger.info("Obstacle: Sensor not available (vision-only mode)")
                 self.logger.info(f"Decision: {decision}")
-                self.logger.info(f"Executing: {action} ({duration_s:.2f}s) | note={self._last_control_note}")
+                self.logger.info(f"Raw→Executed: {raw_action}→{action} ({duration_s:.2f}s) | note={self._last_control_note}")
 
             # Short narration (optional / still throttled)
             if action == "forward":

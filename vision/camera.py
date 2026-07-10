@@ -28,7 +28,7 @@ class CameraPanicException(Exception):
 
 
 class CameraSystem:
-    def __init__(self, config: dict, save_dir: str = "logs/images"):
+    def __init__(self, config: dict, save_dir: str = "logs/images", voice: Optional[VoiceSystem] = None):
         self.logger = logging.getLogger(self.__class__.__name__)
         cs = config.get("camera_settings", {})
         self.resolution = tuple(cs.get("resolution", [640, 480]))
@@ -44,8 +44,8 @@ class CameraSystem:
         self._last_panic_time: float = 0.0
         self._prev_image: Optional[Image.Image] = None
 
-        # Voice system (safe: no-op if disabled or fails)
-        self.voice = VoiceSystem(config)
+        # Voice system (safe: no-op if disabled or fails); shared when provided
+        self.voice = voice if voice is not None else VoiceSystem(config)
 
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
