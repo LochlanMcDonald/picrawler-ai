@@ -8,12 +8,15 @@ Protocol
 --------
 Each datagram starts with a 1-byte message type:
 
-  0x01  POSE     — current robot pose (x, y, theta) as 3× float32
-  0x02  CLOUD    — batch of point cloud points (x, y, z, r, g, b) per point
+  0x01  POSE     — current robot pose (x, y, theta) as 3× float32 (network order)
+  0x02  CLOUD    — header (seq, batch_idx, batch_count) as 3× uint32 (network
+                   order) followed by N points of 6× float32 little-endian
+                   (x, y, z, r, g, b).  A full cloud snapshot is split across
+                   `batch_count` datagrams sharing the same `seq`.
   0x03  LOOP     — loop closure event (from_x, from_y, to_x, to_y) as 4× float32
   0x04  STATS    — ASCII JSON stats string
 
-The host can receive these with the companion `map_viewer.py` script
+The host can receive these with the companion `tools/map_viewer.py` script
 or any UDP listener on the configured port.
 """
 from __future__ import annotations
@@ -37,10 +40,13 @@ _MSG_CLOUD = b'\x02'
 _MSG_LOOP  = b'\x03'
 _MSG_STATS = b'\x04'
 
-# Max UDP payload (stay under typical MTU)
+# Max UDP payload (stay under the 64 KB datagram limit)
 _MAX_UDP = 60_000
-# Points per UDP packet  (6 × float32 = 24 bytes each)
-_POINTS_PER_PKT = _MAX_UDP // 24
+# Bytes per point (6 × float32) and CLOUD header (3 × uint32)
+POINT_BYTES = 24
+CLOUD_HEADER = struct.Struct("!III")
+# Points per UDP packet
+_POINTS_PER_PKT = (_MAX_UDP - CLOUD_HEADER.size) // POINT_BYTES
 
 
 class MapServer:
@@ -78,6 +84,7 @@ class MapServer:
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._cloud_seq = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -176,21 +183,23 @@ class MapServer:
         pts = cloud.points.astype(np.float32)
         cols = cloud.colors.astype(np.uint8)
         n = len(pts)
+        if n == 0:
+            return
 
-        for start in range(0, n, _POINTS_PER_PKT):
+        seq = self._cloud_seq
+        self._cloud_seq = (self._cloud_seq + 1) & 0xFFFFFFFF
+        batch_count = (n + _POINTS_PER_PKT - 1) // _POINTS_PER_PKT
+
+        for batch_idx, start in enumerate(range(0, n, _POINTS_PER_PKT)):
             end = min(start + _POINTS_PER_PKT, n)
-            batch_pts = pts[start:end]
-            batch_cols = cols[start:end]
 
-            # Interleave x,y,z (float32) and r,g,b (uint8 packed into float32 slot)
-            # Format per point: x y z r g b  — 6× float32 (b/g/r as floats 0-255)
-            chunk = np.empty((end - start, 6), dtype=np.float32)
-            chunk[:, :3] = batch_pts
-            chunk[:, 3] = batch_cols[:, 0].astype(np.float32)
-            chunk[:, 4] = batch_cols[:, 1].astype(np.float32)
-            chunk[:, 5] = batch_cols[:, 2].astype(np.float32)
+            # Per point: x y z r g b — 6× little-endian float32 (rgb as 0-255)
+            chunk = np.empty((end - start, 6), dtype="<f4")
+            chunk[:, :3] = pts[start:end]
+            chunk[:, 3:] = cols[start:end].astype(np.float32)
 
-            self._send(_MSG_CLOUD + chunk.tobytes())
+            header = CLOUD_HEADER.pack(seq, batch_idx, batch_count)
+            self._send(_MSG_CLOUD + header + chunk.tobytes())
 
     def _send_stats(self, stats: dict) -> None:
         try:

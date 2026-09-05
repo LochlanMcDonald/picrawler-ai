@@ -250,7 +250,9 @@ class SLAMController:
         # ---- 5. 3D point cloud ------------------------------------------
         now = time.time()
         if depth_map is not None and (now - self._last_cloud_update) >= self._cloud_update_interval:
-            depth_raw = depth_map.depth_map if hasattr(depth_map, 'depth_map') else None
+            depth_raw = getattr(depth_map, "depth_array", None)
+            if depth_raw is None and isinstance(depth_map, np.ndarray):
+                depth_raw = depth_map
             if depth_raw is not None:
                 color_frame = image if len(image.shape) == 3 else None
                 added = self.point_cloud.add_frame(depth_raw, pose, color_frame)
@@ -267,6 +269,12 @@ class SLAMController:
             self.map_server.update_pose(pose)
             if self.point_cloud.point_count() > 0:
                 self.map_server.update_cloud(self.point_cloud.get_cloud())
+            self.map_server.update_stats({
+                "keyframes": len(self.keyframe_store),
+                "pose_graph_nodes": self.pose_graph.node_count(),
+                "loop_closures": len(self._loop_closures),
+                "points": self.point_cloud.point_count(),
+            })
 
         if not self.initialized:
             self.initialized = True
@@ -286,20 +294,18 @@ class SLAMController:
 
         # Feed from point cloud obstacle mask when available
         if self.point_cloud.point_count() > 50:
+            og = self.occupancy_grid
             mask = self.point_cloud.get_obstacle_mask(
-                grid_size_m=self.occupancy_grid.width_m,
-                resolution_m=self.occupancy_grid.resolution_m,
+                grid_size_m=og.width_m,
+                resolution_m=og.resolution_m,
             )
-            # Stamp obstacle cells directly into the log-odds grid
-            gx_off = self.occupancy_grid.origin_x
-            gy_off = self.occupancy_grid.origin_y
-            ys, xs = np.where(mask)
-            for gx, gy in zip(xs, ys):
-                if self.occupancy_grid.is_valid_cell(gx, gy):
-                    self.occupancy_grid.grid[gy, gx] = min(
-                        self.occupancy_grid.grid[gy, gx] + self.occupancy_grid.log_odds_occupied,
-                        self.occupancy_grid.log_odds_max,
-                    )
+            # Both grids are centred on the world origin with the same
+            # resolution; crop to the common region and stamp in one step.
+            h = min(mask.shape[0], og.grid.shape[0])
+            w = min(mask.shape[1], og.grid.shape[1])
+            m = mask[:h, :w]
+            sub = og.grid[:h, :w]
+            sub[m] = np.minimum(sub[m] + og.log_odds_occupied, og.log_odds_max)
             return
 
         # Fallback to directional depth (original behaviour)
@@ -377,7 +383,9 @@ class SLAMController:
                                include_trajectory: bool = False,
                                include_planned_path: bool = True) -> np.ndarray:
         pose = self._corrected_pose
-        vis = self.occupancy_grid.get_visualization(robot_pose=pose)
+        # get_visualization() returns a flipped view; OpenCV drawing needs a
+        # contiguous buffer.
+        vis = np.ascontiguousarray(self.occupancy_grid.get_visualization(robot_pose=pose))
 
         if include_trajectory:
             traj = self.pose_graph.get_trajectory()
@@ -456,6 +464,14 @@ class SLAMController:
         self.initialized = False
         self.logger.info("SLAM system reset")
 
-    def __del__(self) -> None:
+    def shutdown(self) -> None:
+        """Stop background services (map server). Safe to call more than once."""
         if self.map_server:
             self.map_server.stop()
+            self.map_server = None
+
+    def __del__(self) -> None:
+        try:
+            self.shutdown()
+        except Exception:
+            pass

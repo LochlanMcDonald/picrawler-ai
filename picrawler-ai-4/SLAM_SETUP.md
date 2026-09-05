@@ -25,48 +25,115 @@ The robot solves both simultaneously by:
 
 ## Architecture
 
+Pure visual SLAM — camera only, no IMU or wheel encoders.
+
 ```
-Camera Frame
-    ↓
-[Visual Odometry] ← Action hint
-    ↓
-Pose Estimate (x, y, θ)
-    ↓                    ↓
-[Occupancy Grid] ← [Depth Estimation]
-    ↓
-2D Map (free/occupied/unknown)
+Camera Frame ──► [Visual Odometry] ──► raw pose ──► [Pose Graph] ──► corrected pose
+                        │                              ▲                 │
+                        ▼                              │                 ▼
+                 [Keyframe Store] ──► [Loop Closure] ──┘       [3D Point Cloud] ◄── [MiDaS Depth]
+                                                                        │
+                                                          ┌─────────────┴─────────────┐
+                                                          ▼                           ▼
+                                                  [Occupancy Grid]             [Map Server (UDP)]
+                                                  2D navigation map            ──► host map_viewer.py
 ```
 
 ### Components
 
 **1. Visual Odometry** (`perception/visual_odometry.py`)
-- Detects ORB features in each frame
-- Matches features between consecutive frames
-- Estimates camera motion (translation + rotation)
-- Tracks robot pose over time
+- ORB features matched between consecutive frames → per-frame motion estimate
 
-**2. Occupancy Grid** (`mapping/occupancy_grid.py`)
-- 2D grid representation of space
-- Each cell: free, occupied, or unknown
-- Uses log-odds for probabilistic updates
-- Supports ray tracing for sensor integration
+**2. Keyframe Store** (`mapping/keyframe.py`)
+- Saves a frame + ORB descriptors every 0.3 m or 0.3 rad of travel
 
-**3. SLAM Controller** (`mapping/slam_controller.py`)
-- Coordinates visual odometry + mapping
-- Integrates depth estimation for obstacles
-- Generates map visualizations
-- Finds exploration frontiers
+**3. Loop Closure Detector** (`mapping/loop_closure.py`)
+- Matches each new keyframe against older ones (Hamming + Lowe's ratio)
+- Confirms with RANSAC homography before accepting a "we've been here before"
+
+**4. Pose Graph** (`mapping/pose_graph.py`)
+- Odometry edges between consecutive poses, loop edges between revisits
+- Gauss-Seidel optimiser (pure numpy) spreads accumulated drift around the loop
+
+**5. Point Cloud Builder** (`mapping/point_cloud.py`)
+- Projects MiDaS depth into 3D using the corrected pose
+- Produces the obstacle mask that feeds the occupancy grid
+
+**6. Occupancy Grid** (`mapping/occupancy_grid.py`)
+- 2D log-odds grid: free / occupied / unknown, used by the A* path planner
+
+**7. Map Server** (`mapping/map_server.py`)
+- Streams pose, point cloud, loop closures and stats over UDP to your laptop
+
+**8. SLAM Controller** (`mapping/slam_controller.py`)
+- Wires everything together; one `process_frame()` call per camera frame
 
 ## Installation
 
-No new dependencies needed! SLAM uses existing OpenCV and NumPy.
+### On the robot (Raspberry Pi)
+
+Raspberry Pi OS blocks system-wide `pip install`, so use a virtual environment
+that can still see the apt-installed Picamera2 / robot HAT libraries:
 
 ```bash
-cd ~/picrawler-ai/picrawler-ai-4
-git pull
+cd ~/picrawler-ai
+git pull origin main
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install -r picrawler-ai-4/requirements.txt
 ```
 
-That's it - you're ready to run SLAM.
+Activate the venv in every new terminal before running anything:
+
+```bash
+source ~/picrawler-ai/.venv/bin/activate
+```
+
+The map server is **enabled by default** in `config/config.json` and broadcasts
+to the whole LAN on UDP port 5005. If your Wi-Fi blocks broadcast, set
+`map_server_settings.host` to your laptop's IP address instead.
+
+### On your laptop (viewer)
+
+Only numpy and matplotlib are needed — you do not need the rest of the repo:
+
+```bash
+pip install numpy matplotlib
+```
+
+Copy `picrawler-ai-4/tools/map_viewer.py` to the laptop (or clone the repo).
+
+## Live 3D viewer
+
+Run the viewer on the laptop **first**, then start SLAM on the robot. Both
+machines must be on the same network.
+
+```bash
+# Laptop
+python tools/map_viewer.py                  # 2D top-down + 3D point cloud
+python tools/map_viewer.py --no-3d          # 2D only, lighter on CPU
+python tools/map_viewer.py --export map.ply # save the cloud when you close the window
+```
+
+```bash
+# Robot
+cd ~/picrawler-ai/picrawler-ai-4
+python main.py --mode slam_explore --duration 5
+```
+
+What you see:
+
+| Colour | Meaning |
+|--------|---------|
+| Coloured dots | 3D point cloud (camera colours, or blue→red by height) |
+| Blue line | Robot trajectory |
+| Green arrow | Current pose and heading |
+| **Red line** | Loop closure — the robot recognised a place it had seen before and corrected drift |
+
+The status bar shows point count, pose count, loop closures, keyframes and
+seconds since the last packet. "waiting for robot…" means nothing has arrived
+yet — check both machines are on the same network and port 5005 is not
+firewalled.
 
 ## Usage Modes
 

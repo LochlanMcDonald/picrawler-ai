@@ -80,9 +80,9 @@ class PointCloudBuilder:
         # Pre-compute per-pixel ray angles
         self._ray_h, self._ray_v = self._build_ray_grid()
 
-        # Accumulated point cloud
-        self._points: List[np.ndarray] = []   # (3,) float32 each
-        self._colors: List[np.ndarray] = []   # (3,) uint8 each
+        # Accumulated point cloud (contiguous arrays, oldest first)
+        self._points = np.zeros((0, 3), dtype=np.float32)
+        self._colors = np.zeros((0, 3), dtype=np.uint8)
         self._total_added = 0
 
     # ------------------------------------------------------------------
@@ -170,30 +170,28 @@ class PointCloudBuilder:
             # Height-based colouring: low=blue, mid=green, high=red
             new_cols = self._height_color(z_world[valid])
 
-        for i in range(len(new_pts)):
-            self._points.append(new_pts[i])
-            self._colors.append(new_cols[i])
+        if len(new_pts) > 0:
+            self._points = np.concatenate(
+                [self._points, new_pts.astype(np.float32)], axis=0
+            )
+            self._colors = np.concatenate(
+                [self._colors, new_cols.astype(np.uint8)], axis=0
+            )
 
         self._total_added += len(new_pts)
 
         # Prune if over capacity (drop oldest)
         if len(self._points) > self.max_points:
-            excess = len(self._points) - self.max_points
-            self._points = self._points[excess:]
-            self._colors = self._colors[excess:]
+            self._points = self._points[-self.max_points:]
+            self._colors = self._colors[-self.max_points:]
 
         return len(new_pts)
 
     def get_cloud(self) -> PointCloud:
-        """Return the current accumulated point cloud."""
-        if not self._points:
-            return PointCloud(
-                points=np.zeros((0, 3), dtype=np.float32),
-                colors=np.zeros((0, 3), dtype=np.uint8),
-            )
+        """Return a copy of the current accumulated point cloud."""
         return PointCloud(
-            points=np.array(self._points, dtype=np.float32),
-            colors=np.array(self._colors, dtype=np.uint8),
+            points=self._points.copy(),
+            colors=self._colors.copy(),
         )
 
     def get_height_map(self,
@@ -205,25 +203,25 @@ class PointCloudBuilder:
         Returns:
             HxW float32 array, NaN where no points observed
         """
-        if not self._points:
-            cells = int(grid_size_m / resolution_m)
-            return np.full((cells, cells), np.nan, dtype=np.float32)
-
-        pts = np.array(self._points, dtype=np.float32)
         cells = int(grid_size_m / resolution_m)
-        half = grid_size_m / 2.0
-
         height_map = np.full((cells, cells), np.nan, dtype=np.float32)
+        if len(self._points) == 0:
+            return height_map
+
+        pts = self._points
+        half = grid_size_m / 2.0
 
         ix = ((pts[:, 0] + half) / resolution_m).astype(int)
         iy = ((pts[:, 1] + half) / resolution_m).astype(int)
         z = pts[:, 2]
 
         valid = (ix >= 0) & (ix < cells) & (iy >= 0) & (iy < cells)
-        for i in np.where(valid)[0]:
-            r, c = iy[i], ix[i]
-            if np.isnan(height_map[r, c]) or z[i] > height_map[r, c]:
-                height_map[r, c] = z[i]
+        # Vectorised per-cell max: start at -inf, scatter-max, then mark
+        # untouched cells as NaN.
+        acc = np.full((cells, cells), -np.inf, dtype=np.float32)
+        np.maximum.at(acc, (iy[valid], ix[valid]), z[valid])
+        touched = np.isfinite(acc)
+        height_map[touched] = acc[touched]
 
         return height_map
 
@@ -238,15 +236,13 @@ class PointCloudBuilder:
         Points between min and max height are considered obstacles
         (above ground, below camera).
         """
-        if not self._points:
-            cells = int(grid_size_m / resolution_m)
-            return np.zeros((cells, cells), dtype=bool)
-
-        pts = np.array(self._points, dtype=np.float32)
         cells = int(grid_size_m / resolution_m)
-        half = grid_size_m / 2.0
-
         mask = np.zeros((cells, cells), dtype=bool)
+        if len(self._points) == 0:
+            return mask
+
+        pts = self._points
+        half = grid_size_m / 2.0
 
         obstacle = (pts[:, 2] >= min_height_m) & (pts[:, 2] <= max_height_m)
         pts_obs = pts[obstacle]
@@ -263,8 +259,8 @@ class PointCloudBuilder:
         return len(self._points)
 
     def reset(self) -> None:
-        self._points.clear()
-        self._colors.clear()
+        self._points = np.zeros((0, 3), dtype=np.float32)
+        self._colors = np.zeros((0, 3), dtype=np.uint8)
         self._total_added = 0
 
     # ------------------------------------------------------------------

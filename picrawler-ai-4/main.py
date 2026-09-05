@@ -394,6 +394,7 @@ def main() -> int:
             # Save final map
             logger.info("SLAM session complete!")
             slam_controller.save_map('logs/slam_map_final.jpg')
+            slam_controller.shutdown()
 
             stats = slam_controller.get_statistics()
             logger.info("Final statistics:")

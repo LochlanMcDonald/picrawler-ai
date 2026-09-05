@@ -10,7 +10,10 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from mapping.map_server import MapServer, _MSG_POSE, _MSG_CLOUD, _MSG_LOOP, _MSG_STATS
+from mapping.map_server import (
+    CLOUD_HEADER, POINT_BYTES, MapServer, _MSG_POSE, _MSG_CLOUD, _MSG_LOOP,
+    _MSG_STATS, _POINTS_PER_PKT,
+)
 from mapping.point_cloud import PointCloud
 from perception.visual_odometry import Pose2D
 
@@ -222,16 +225,38 @@ class TestPacketBuilders:
         )
         self.server._send_cloud(cloud)
         pkt = self.packets[0]
-        # 1 byte type + 6 float32 = 25 bytes
-        assert len(pkt) == 1 + 6 * 4
-        # numpy.tobytes() uses native byte order — use '<' (little-endian) on x86
-        vals = np.frombuffer(pkt[1:], dtype=np.float32)
+        # 1 byte type + 12 byte header + 6 float32 = 37 bytes
+        assert len(pkt) == 1 + CLOUD_HEADER.size + 6 * 4
+        seq, batch_idx, batch_count = CLOUD_HEADER.unpack(pkt[1:1 + CLOUD_HEADER.size])
+        assert seq == 0
+        assert batch_idx == 0
+        assert batch_count == 1
+        vals = np.frombuffer(pkt[1 + CLOUD_HEADER.size:], dtype="<f4")
         assert abs(vals[0] - 1.0) < 1e-5  # x
         assert abs(vals[1] - 2.0) < 1e-5  # y
         assert abs(vals[2] - 3.0) < 1e-5  # z
         assert abs(vals[3] - 255.0) < 1e-4  # r
         assert abs(vals[4] - 128.0) < 1e-4  # g
         assert abs(vals[5] - 64.0) < 1e-4   # b
+
+    def test_cloud_seq_increments_per_snapshot(self):
+        self.server._send_cloud(_small_cloud(2))
+        self.server._send_cloud(_small_cloud(2))
+        seqs = [CLOUD_HEADER.unpack(p[1:1 + CLOUD_HEADER.size])[0] for p in self.packets]
+        assert seqs == [0, 1]
+
+    def test_large_cloud_split_into_batches(self):
+        n = _POINTS_PER_PKT * 2 + 5
+        self.server._send_cloud(_small_cloud(n))
+        assert len(self.packets) == 3
+        headers = [CLOUD_HEADER.unpack(p[1:1 + CLOUD_HEADER.size]) for p in self.packets]
+        assert [h[1] for h in headers] == [0, 1, 2]
+        assert all(h[2] == 3 for h in headers)
+        assert all(h[0] == headers[0][0] for h in headers)
+        total_points = sum(
+            (len(p) - 1 - CLOUD_HEADER.size) // POINT_BYTES for p in self.packets
+        )
+        assert total_points == n
 
 
 # ---------------------------------------------------------------------------

@@ -16,14 +16,38 @@
   "slam_settings": {
     "map_size_m": 20.0,
     "map_resolution_m": 0.05,
-    "enable_loop_closure": false,
-    "loop_check_interval_s": 2.0
+    "map_update_interval_s": 0.5,
+    "pg_max_iterations": 100,
+    "pg_convergence_tol": 0.0001
   },
   "visual_odometry_settings": {
     "camera_height_m": 0.1,
     "camera_tilt_deg": 20.0,
     "scale_calibration_factor": 1.0,
     "feature_count": 500
+  },
+  "keyframe_settings": {
+    "min_distance_m": 0.3,
+    "min_rotation_rad": 0.3,
+    "max_keyframes": 500,
+    "feature_count": 500
+  },
+  "loop_closure_settings": {
+    "min_score": 0.25,
+    "min_inliers": 12,
+    "min_age_frames": 10,
+    "top_k_candidates": 5
+  },
+  "point_cloud_settings": {
+    "max_points": 100000,
+    "subsample": 8,
+    "update_interval_s": 1.0
+  },
+  "map_server_settings": {
+    "enabled": true,
+    "host": "255.255.255.255",
+    "port": 5005,
+    "broadcast_hz": 2.0
   },
   "path_planning_settings": {
     "obstacle_inflation_radius_m": 0.15,
@@ -52,7 +76,10 @@
     "aggressive_forward_duration_s": 0.8
   },
   "camera_settings": {
-    "resolution": [640, 480],
+    "resolution": [
+      640,
+      480
+    ],
     "capture_interval_s": 2.5,
     "image_quality": 85,
     "flip_h": false,
