@@ -13,6 +13,7 @@ from core.logger import setup_logging
 from core.robot_controller import RobotController
 from vision.camera import CameraSystem
 from ai.vision_ai import AIVisionSystem
+from voice.voice_system import VoiceSystem
 from behaviors.exploration import ExplorationBehavior
 from behaviors.object_detection import ObjectDetectionBehavior
 from behaviors.following import FollowingBehavior
@@ -52,9 +53,12 @@ def main() -> int:
     ai: AIVisionSystem | None = None
 
     try:
+        # One shared voice system so cooldown/dedupe apply across subsystems
+        voice = VoiceSystem(config)
+
         robot = RobotController(config)
-        camera = CameraSystem(config)
-        ai = AIVisionSystem(config)
+        camera = CameraSystem(config, voice=voice)
+        ai = AIVisionSystem(config, voice=voice)
 
         if args.mode == "test":
             # Simple self-test: capture one frame and run one analysis
@@ -84,6 +88,7 @@ def main() -> int:
             duration_minutes=args.duration,
             target=args.target,
             verbose=args.verbose,
+            voice=voice,
         )
         behavior.run()
         return 0

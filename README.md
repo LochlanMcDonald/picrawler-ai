@@ -56,11 +56,28 @@ python main.py --mode test
 - If `picrawler` is installed and your SunFounder PiCrawler is connected, the project will drive real movement.
 - If not, it runs in **dry-run** mode (prints actions instead of moving).
 
-## Developer utilities
+## Safety
+Multiple layers keep the robot from driving into things even when the AI misbehaves:
+- **Action allowlist** — anything the model returns outside the known action set is coerced to `stop`, and durations are clamped.
+- **Ultrasonic override** — `forward` is blocked before it starts if an obstacle is inside the threshold, and motion is **monitored mid-move** and aborted early if an obstacle appears.
+- **Anti-loop watchdog** — repeated actions, left/right oscillation, and stagnant scenes trigger an escape sequence with temporary action bans.
+- **Camera panic stop** — a sudden large visual change (falling, being picked up) raises an emergency stop.
+- **Fail-safe AI errors** — API failures resolve to `stop`, never to a guess.
+
+## Running the tests
+The core logic (safety gate, anti-loop watchdog, AI decision contract, panic detection) is covered by a hardware-free test suite:
 ```bash
-python utils/test_camera.py
-python utils/test_ai.py
-python utils/test_motors.py
+pip install -r requirements-dev.txt
+pytest
+```
+Tests run automatically in CI on every push.
+
+## Hardware smoke checks (on the Pi)
+```bash
+python utils/check_camera.py
+python utils/check_ai.py
+python utils/check_motors.py
+python utils/check_ultrasonic.py
 ```
 
 ## Manual gait tooling (optional)

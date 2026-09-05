@@ -11,9 +11,10 @@ run on a dev machine or a Pi without the robot attached.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 
 @dataclass
@@ -65,13 +66,11 @@ class MockRobot(BaseRobot):
     def turn_left(self, speed: int) -> None:
         self.logger.info(f"MOCK: turn_left speed={speed}")
         # Simulate different distance after turning
-        import random
         self._mock_distance = random.uniform(20, 80)
 
     def turn_right(self, speed: int) -> None:
         self.logger.info(f"MOCK: turn_right speed={speed}")
         # Simulate different distance after turning
-        import random
         self._mock_distance = random.uniform(20, 80)
 
     def stop(self) -> None:
@@ -326,6 +325,42 @@ class RobotController:
             "sensor_available": distance is not None,
         }
 
+    def _timed_move(
+        self,
+        start_motion: Callable[[], None],
+        duration_s: float,
+        *,
+        monitor_obstacles: bool = False,
+        poll_interval_s: float = 0.05,
+    ) -> None:
+        """Run a motion for duration_s, then stop.
+
+        With monitor_obstacles=True the ultrasonic sensor is polled while
+        moving, and the motion is aborted early if an obstacle crosses the
+        threshold (instead of driving blind for the full duration).
+        """
+        start_motion()
+        try:
+            if not monitor_obstacles:
+                time.sleep(duration_s)
+                return
+
+            deadline = time.time() + duration_s
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                if self.has_obstacle():
+                    d = self.get_distance()
+                    self.logger.warning(
+                        "Obstacle at %scm appeared mid-motion - stopping early",
+                        f"{d:.1f}" if d is not None else "?",
+                    )
+                    break
+                time.sleep(min(poll_interval_s, remaining))
+        finally:
+            self.robot.stop()
+
     def execute(self, action: str, duration_s: float = 0.6) -> None:
         """Execute a simple motion primitive."""
         action = action.lower().strip()
@@ -338,10 +373,10 @@ class RobotController:
 
         # Check for obstacles before forward movement
         if action in {"forward", "ahead"}:
-            if self.has_obstacle():
-                distance = self.get_distance()
+            info = self.get_obstacle_info()
+            if info["has_obstacle"]:
                 self.logger.warning(
-                    f"Obstacle detected at {distance:.1f}cm (< {self.obstacle_threshold_cm}cm) - "
+                    f"Obstacle detected at {info['distance_cm']:.1f}cm (< {self.obstacle_threshold_cm}cm) - "
                     "blocking forward movement"
                 )
                 action = "stop"
@@ -349,24 +384,18 @@ class RobotController:
         self.logger.info(f"ACTION: {action} duration={duration_s}")
 
         if action in {"forward", "ahead"}:
-            self.robot.forward(self.move_speed)
-            time.sleep(duration_s)
-            self.robot.stop()
+            self._timed_move(
+                lambda: self.robot.forward(self.move_speed), duration_s, monitor_obstacles=True
+            )
 
         elif action in {"back", "backward", "reverse"}:
-            self.robot.backward(self.move_speed)
-            time.sleep(duration_s)
-            self.robot.stop()
+            self._timed_move(lambda: self.robot.backward(self.move_speed), duration_s)
 
         elif action in {"turn_left", "left"}:
-            self.robot.turn_left(self.turn_speed)
-            time.sleep(duration_s)
-            self.robot.stop()
+            self._timed_move(lambda: self.robot.turn_left(self.turn_speed), duration_s)
 
         elif action in {"turn_right", "right"}:
-            self.robot.turn_right(self.turn_speed)
-            time.sleep(duration_s)
-            self.robot.stop()
+            self._timed_move(lambda: self.robot.turn_right(self.turn_speed), duration_s)
 
         elif action in {"stop", "halt"}:
             self.robot.stop()

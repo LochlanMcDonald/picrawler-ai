@@ -1,11 +1,26 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
+*.py[cod]
 *.egg-info/
-dist/
-build/
+.venv/
+venv/
+
+# Test / coverage
+.pytest_cache/
 .coverage
-coverage.xml
-*.log
+htmlcov/
+
+# Runtime output
 logs/
+
+# Secrets & local config
+config/config.json
+.env
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Coverage XML from CI
+coverage.xml

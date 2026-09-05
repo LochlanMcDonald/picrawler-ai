@@ -26,8 +26,8 @@ export OPENAI_API_KEY="..."
 
 ## 4) Test camera + AI
 ```bash
-python utils/test_camera.py
-python utils/test_ai.py
+python utils/check_camera.py
+python utils/check_ai.py
 python main.py --mode test
 ```
 

@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: v3 (repo root)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest --cov=ai --cov=behaviors --cov=core --cov=vision --cov=voice --cov-report=term-missing
+
+  test-v4:
+    name: v4 (picrawler-ai-4, SLAM)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    defaults:
+      run:
+        working-directory: picrawler-ai-4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        # torch/timm are stubbed by tests/conftest.py, so the heavy ML deps are skipped in CI
+        run: pip install pytest pytest-mock pytest-cov numpy opencv-python-headless Pillow
+
+      - name: Run tests
+        run: pytest tests/ --cov=. --cov-report=term-missing --cov-report=xml:coverage.xml
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-v4-py${{ matrix.python-version }}
+          path: picrawler-ai-4/coverage.xml

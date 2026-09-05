@@ -1,0 +1,76 @@
+{
+  "openai_api_key": "your-api-key-here",
+  "ai_settings": {
+    "model": "gpt-4.1-mini",
+    "max_output_tokens": 800,
+    "temperature": 0.4,
+    "request_timeout_s": 30,
+    "min_seconds_between_calls": 3.0
+  },
+  "robot_settings": {
+    "movement_speed": 50,
+    "turn_speed": 45,
+    "step_delay": 0.05,
+    "obstacle_distance_threshold_cm": 20,
+    "dry_run_if_no_hardware": true
+  },
+  "camera_settings": {
+    "resolution": [640, 480],
+    "capture_interval_s": 2.5,
+    "image_quality": 85,
+    "flip_h": false,
+    "flip_v": false,
+    "panic_on_visual_change": true,
+    "panic_change_threshold": 35.0,
+    "panic_cooldown_s": 1.0
+  },
+  "voice_settings": {
+    "enabled": true,
+    "model": "gpt-4o-mini-tts",
+    "voice": "alloy",
+    "format": "mp3",
+    "speed": 1.0,
+    "cooldown_s": 2.5,
+    "dedupe_window_s": 15.0,
+    "verbosity": "normal",
+    "max_chars": 260,
+    "narration_enabled": true,
+    "narration_min_interval_s": 4.0,
+    "dialogue_enabled": true,
+    "dialogue_min_interval_s": 10.0,
+    "dialogue_dedupe_window_s": 30.0,
+    "thoughts_enabled": false,
+    "thoughts_force_each_tick": true,
+    "thoughts_min_interval_s": 0.0,
+    "thought_max_chars": 240,
+    "ai_failure_speak_cooldown_s": 25.0
+  },
+  "personality_settings": {
+    "name": "Nimue",
+    "style": "curious, analytical",
+    "humor": "dry",
+    "max_words": 20
+  },
+  "behavior_settings": {
+    "anti_loop": {
+      "anti_loop_history": 8,
+      "anti_loop_repeat_threshold": 3,
+      "anti_loop_oscillation_window": 4,
+      "scene_history": 10,
+      "scene_repeat_threshold": 4,
+      "ban_seconds": 8.0,
+      "escape_stop_s": 0.25,
+      "escape_back_s": 1.25,
+      "escape_turn_s": 1.1,
+      "escape_forward_s": 1.35,
+      "escape_cooldown_s": 3.0,
+      "escape_strikes_reset": 6,
+      "max_obstacle_overrides_before_escape": 3
+    }
+  },
+  "logging_settings": {
+    "log_level": "INFO",
+    "save_images": true,
+    "save_decisions": true
+  }
+}
