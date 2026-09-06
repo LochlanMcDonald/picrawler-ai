@@ -72,8 +72,8 @@ def load_config(config_path: str) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PiCrawler-AI v4 - Robust Architecture")
     p.add_argument("--mode", default="explore",
-                  choices=["explore", "cautious", "test", "language", "interactive", "slam", "slam_explore", "navigate"],
-                  help="Operation mode")
+                  choices=["explore", "cautious", "test", "language", "interactive", "slam", "slam_explore", "navigate", "guided"],
+                  help="Operation mode (guided = look, explain, propose, ask you, then act)")
     p.add_argument("--duration", type=float, default=5,
                   help="Run duration in minutes")
     p.add_argument("--config", default="config/config.json",
@@ -123,7 +123,7 @@ def main() -> int:
         api_key = config.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
         has_key = bool(api_key) and api_key != "your-api-key-here"
 
-        if args.mode in offline_modes and not has_key:
+        if args.mode in (offline_modes | {"guided"}) and not has_key:
             vision_ai = None
             ai_planner = None
             logger.info(
@@ -330,6 +330,42 @@ def main() -> int:
                         break
 
                 return 0
+
+        # Guided mode: look → explain out loud → propose → ask you → act
+        if args.mode == "guided":
+            from planning.guided_explorer import GuidedDecider, GuidedExplorer
+            from voice.listener import UserListener
+            from voice.voice_system import VoiceSystem
+
+            logger.info("=" * 70)
+            logger.info("Guided Mode - the robot explains what it sees and asks before acting")
+            logger.info("=" * 70)
+
+            # The panic alarm fires on every step because the view changes when
+            # the robot walks. It is noise in this mode.
+            camera.enable_panic = False
+
+            voice = getattr(camera, "voice", None) or VoiceSystem(config)
+            if not getattr(voice, "settings", None) or not voice.settings.enabled:
+                logger.warning("Voice is disabled - the robot will only print its speech")
+
+            openai_client = getattr(vision_ai, "client", None)
+            decider = GuidedDecider(config, client=openai_client)
+            if not has_key:
+                decider.client = None
+                logger.warning("No OpenAI key - decisions will be rule-based and there is no scene description")
+
+            listener = UserListener(config, openai_client=openai_client, logger=logger)
+            logger.info(f"Answers via: {listener.mode}  (type yes/no/left/right/forward/back/quit)")
+
+            explorer = GuidedExplorer(
+                camera=camera, vision_ai=vision_ai, decider=decider, voice=voice,
+                robot=robot, world_model=world_model, memory=memory, listener=listener,
+                depth_estimator=depth_estimator, config=config, logger=logger,
+            )
+            rc = explorer.run(args.duration)
+            logger.info(f"Guided session over: {explorer.cycles} cycles, {explorer.executed} actions")
+            return rc
 
         # SLAM mode: Build map while exploring
         if args.mode in ["slam", "slam_explore"]:
