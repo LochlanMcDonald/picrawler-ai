@@ -110,15 +110,22 @@ def main() -> int:
 
         # Perception
         camera = CameraSystem(config)
-        vision_ai = VisionAI(config)
         depth_estimator = DepthEstimator(
             model_type="MiDaS_small",  # Pi-optimized
             input_size=256,  # Lower resolution for speed
             cache_duration_s=1.0  # Update depth every second
         )
 
-        # Planning
-        ai_planner = AIPlanner(config)
+        # Cloud AI (OpenAI) is only needed by the vision/planning modes.
+        # SLAM and navigation run fully offline, so don't demand an API key there.
+        offline_modes = {"slam", "slam_explore", "navigate"}
+        if args.mode in offline_modes:
+            vision_ai = None
+            ai_planner = None
+            logger.info(f"Mode '{args.mode}' runs offline - skipping OpenAI initialisation")
+        else:
+            vision_ai = VisionAI(config)
+            ai_planner = AIPlanner(config)
 
         # World model (sensor fusion)
         threshold = config.get("robot_settings", {}).get("obstacle_distance_threshold_cm", 20.0)

@@ -52,10 +52,18 @@ class VoiceSystem:
             max_chars=int(vs.get("max_chars", 260)),
         )
 
-        # OpenAI client (requires API key via env or config)
-        self.client = OpenAI(
-            api_key=None if api_key in (None, "", "your-api-key-here") else api_key
-        )
+        # OpenAI client (requires API key via env or config). Voice is a
+        # convenience feature — a missing key must never stop the robot from
+        # running modes that do not need the cloud (e.g. SLAM).
+        self.client = None
+        if self.settings.enabled:
+            try:
+                self.client = OpenAI(
+                    api_key=None if api_key in (None, "", "your-api-key-here") else api_key
+                )
+            except Exception as e:  # OpenAIError on missing credentials
+                self.logger.warning(f"Voice disabled: {e}")
+                self.settings.enabled = False
 
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
