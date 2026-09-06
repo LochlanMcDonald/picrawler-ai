@@ -46,6 +46,11 @@ class BaseRobot:
         """Get distance reading from ultrasonic sensor in cm."""
         return None  # Default: no sensor
 
+    def is_blocking(self) -> bool:
+        """True if forward()/turn_*() block for one gait cycle instead of
+        starting a continuous motion. Default: continuous (non-blocking)."""
+        return False
+
 
 class MockRobot(BaseRobot):
     def __init__(self) -> None:
@@ -126,28 +131,43 @@ class SunFounderPiCrawlerRobot(BaseRobot):
             except Exception as e:
                 self.logger.debug(f"Posture '{pose}' not available: {e}")
 
-    def _do(self, name: str, speed: int) -> None:
+    # SunFounder motion names (note the spaces — these are dict keys in the
+    # library's move_list, and an unknown key only *prints* "No such action").
+    _ACTION_NAMES = {
+        "forward": "forward",
+        "backward": "backward",
+        "turn_left": "turn left",
+        "turn_right": "turn right",
+        "stand": "stand",
+        "sit": "sit",
+    }
+
+    def _do(self, name: str, speed: int, step: int = 1) -> None:
         """
-        Call into the underlying SunFounder API using the best available method.
-        Tries do_action first, then do_step, then a direct callable attribute.
+        Run one SunFounder motion.
+
+        The library signature is ``do_action(motion_name, step=1, speed=50)``.
+        Passing speed positionally lands in the *step* slot and makes the robot
+        repeat the gait `speed` times, so always use keyword arguments.
         """
-        # Most common in SunFounder PiCrawler libs
+        motion = self._ACTION_NAMES.get(name, name)
+
         if hasattr(self.crawler, "do_action"):
             try:
-                self.crawler.do_action(name, speed)  # type: ignore[attr-defined]
+                self.crawler.do_action(motion, step=step, speed=speed)  # type: ignore[attr-defined]
                 return
             except TypeError:
-                # some versions may not take speed for some actions
-                self.crawler.do_action(name)  # type: ignore[attr-defined]
+                # Older variants without a `step` parameter
+                self.crawler.do_action(motion, speed=speed)  # type: ignore[attr-defined]
                 return
 
-        # Some versions treat actions as named steps
+        # Some variants treat actions as named steps
         if hasattr(self.crawler, "do_step"):
             try:
-                self.crawler.do_step(name, speed)  # type: ignore[attr-defined]
+                self.crawler.do_step(motion, speed=speed)  # type: ignore[attr-defined]
                 return
             except TypeError:
-                self.crawler.do_step(name)  # type: ignore[attr-defined]
+                self.crawler.do_step(motion)  # type: ignore[attr-defined]
                 return
 
         # Last resort: direct method if it exists
@@ -164,65 +184,36 @@ class SunFounderPiCrawlerRobot(BaseRobot):
             f"(no do_action/do_step and no callable attribute)."
         )
 
+    # Each call below performs ONE blocking gait cycle (~1 s). The controller
+    # repeats them to fill the requested duration.
     def forward(self, speed: int) -> None:
-        # common naming in SunFounder actions
         self._do("forward", speed)
 
     def backward(self, speed: int) -> None:
-        # some libs use backward; some use back
-        for name in ("backward", "back"):
-            try:
-                self._do(name, speed)
-                return
-            except Exception as e:
-                self.logger.debug(f"Action '{name}' not available: {e}")
-                continue
-        # last try (will raise if not found):
         self._do("backward", speed)
 
     def turn_left(self, speed: int) -> None:
-        # common naming variants
-        for name in ("turn_left", "left"):
-            try:
-                self._do(name, speed)
-                return
-            except Exception as e:
-                self.logger.debug(f"Action '{name}' not available: {e}")
-                continue
-        # last try (will raise if not found):
         self._do("turn_left", speed)
 
     def turn_right(self, speed: int) -> None:
-        for name in ("turn_right", "right"):
-            try:
-                self._do(name, speed)
-                return
-            except Exception as e:
-                self.logger.debug(f"Action '{name}' not available: {e}")
-                continue
-        # last try (will raise if not found):
         self._do("turn_right", speed)
 
     def stop(self) -> None:
-        # stop often ignores speed; try both call shapes
-        for name in ("stop", "halt"):
-            try:
-                self._do(name, 0)
-                return
-            except Exception as e:
-                self.logger.debug(f"Action '{name}' not available: {e}")
-                continue
-        # If stop isn't a known action, try direct attr without speed
+        # The gait is blocking and finishes on its own; the library has no
+        # "stop" motion. A direct stop() method is used if a variant offers one.
         fn = getattr(self.crawler, "stop", None)
         if callable(fn):
-            fn()
-            return
-        # As a last resort, log critical error (cannot stop robot!)
-        self.logger.error("CRITICAL: No stop() method or stop action available on hardware!")
+            try:
+                fn()
+            except Exception as e:
+                self.logger.debug(f"crawler.stop() failed: {e}")
 
     def posture(self, name: str, speed: int) -> None:
-        # Postures are typically steps
-        self._do(name, speed)
+        self._do(name, speed, step=1)
+
+    def is_blocking(self) -> bool:
+        """Motions block until the gait cycle completes."""
+        return True
 
     def get_distance(self) -> Optional[float]:
         """Get distance reading from ultrasonic sensor in cm.
@@ -260,13 +251,17 @@ class ActionWatchdog:
     even if main thread hangs or blocks.
     """
 
-    def __init__(self, max_duration_s: float = 2.0):
+    def __init__(self, max_duration_s: float = 2.0, grace_s: float = 2.0):
         """
         Args:
             max_duration_s: Maximum allowed action duration (hard limit)
+            grace_s: Extra time allowed before the watchdog fires. Blocking
+                     gait backends (SunFounder) may overrun the requested
+                     duration by up to one gait cycle, which is normal.
         """
         self.logger = logging.getLogger(self.__class__.__name__)
         self.max_duration_s = max_duration_s
+        self.grace_s = grace_s
 
         self.robot: Optional[BaseRobot] = None
         self.timer: Optional[threading.Timer] = None
@@ -306,7 +301,7 @@ class ActionWatchdog:
 
             # Start watchdog timer with small buffer for cleanup
             self.timer = threading.Timer(
-                self.max_duration_s + 0.5,  # Extra 0.5s grace period
+                self.max_duration_s + self.grace_s,
                 self._timeout_callback
             )
             self.timer.daemon = True
@@ -378,8 +373,15 @@ class RobotController:
         self.robot: BaseRobot = self._init_robot()
 
         # Initialize watchdog for action timeout enforcement
-        self.watchdog = ActionWatchdog(max_duration_s=max_action_duration)
+        self.watchdog = ActionWatchdog(
+            max_duration_s=max_action_duration,
+            grace_s=float(rs.get("action_grace_s", 2.0)),
+        )
         self.watchdog.set_robot(self.robot)
+
+        # Last motion actually sent to the hardware (used as a visual
+        # odometry direction hint by SLAM modes)
+        self.last_action: Optional[str] = None
 
         # Check if ultrasonic sensor is available
         distance = self.robot.get_distance()
@@ -432,6 +434,29 @@ class RobotController:
             "sensor_available": distance is not None,
         }
 
+    def _run_motion(self, motion, speed: int, duration_s: float) -> None:
+        """Drive one motion primitive for `duration_s`.
+
+        Continuous backends (mock, wheeled): start motion, sleep, stop.
+        Blocking backends (SunFounder gait): repeat one-cycle calls until the
+        duration has elapsed, then stop.
+        """
+        if not self.robot.is_blocking():
+            motion(speed)
+            time.sleep(duration_s)
+            self.robot.stop()
+            return
+
+        deadline = time.monotonic() + duration_s
+        cycles = 0
+        while True:
+            motion(speed)          # one blocking gait cycle
+            cycles += 1
+            if time.monotonic() >= deadline:
+                break
+        self.robot.stop()
+        self.logger.debug(f"Motion completed in {cycles} gait cycle(s)")
+
     def execute(self, action: str, duration_s: float = 0.6) -> None:
         """Execute a simple motion primitive with watchdog timeout enforcement."""
         action = action.lower().strip()
@@ -454,29 +479,22 @@ class RobotController:
 
         # Start watchdog and get capped duration
         capped_duration = self.watchdog.start_action(action, duration_s)
+        self.last_action = action
 
         self.logger.info(f"ACTION: {action} duration={capped_duration:.2f}s (requested={duration_s:.2f}s)")
 
         try:
             if action in {"forward", "ahead"}:
-                self.robot.forward(self.move_speed)
-                time.sleep(capped_duration)
-                self.robot.stop()
+                self._run_motion(self.robot.forward, self.move_speed, capped_duration)
 
             elif action in {"back", "backward", "reverse"}:
-                self.robot.backward(self.move_speed)
-                time.sleep(capped_duration)
-                self.robot.stop()
+                self._run_motion(self.robot.backward, self.move_speed, capped_duration)
 
             elif action in {"turn_left", "left"}:
-                self.robot.turn_left(self.turn_speed)
-                time.sleep(capped_duration)
-                self.robot.stop()
+                self._run_motion(self.robot.turn_left, self.turn_speed, capped_duration)
 
             elif action in {"turn_right", "right"}:
-                self.robot.turn_right(self.turn_speed)
-                time.sleep(capped_duration)
-                self.robot.stop()
+                self._run_motion(self.robot.turn_right, self.turn_speed, capped_duration)
 
             elif action in {"stop", "halt"}:
                 self.robot.stop()

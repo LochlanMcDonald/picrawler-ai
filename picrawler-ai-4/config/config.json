@@ -11,7 +11,8 @@
     "step_delay": 0.05,
     "obstacle_distance_threshold_cm": 20,
     "dry_run_if_no_hardware": true,
-    "max_action_duration_s": 2.0
+    "max_action_duration_s": 2.0,
+    "action_grace_s": 2.0
   },
   "slam_settings": {
     "map_size_m": 20.0,

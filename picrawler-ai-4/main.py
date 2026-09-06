@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -119,13 +120,21 @@ def main() -> int:
         # Cloud AI (OpenAI) is only needed by the vision/planning modes.
         # SLAM and navigation run fully offline, so don't demand an API key there.
         offline_modes = {"slam", "slam_explore", "navigate"}
-        if args.mode in offline_modes:
+        api_key = config.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+        has_key = bool(api_key) and api_key != "your-api-key-here"
+
+        if args.mode in offline_modes and not has_key:
             vision_ai = None
             ai_planner = None
-            logger.info(f"Mode '{args.mode}' runs offline - skipping OpenAI initialisation")
+            logger.info(
+                f"Mode '{args.mode}' running without OpenAI (no API key configured). "
+                "Add openai_api_key to config/config.json to enable AI scene understanding."
+            )
         else:
             vision_ai = VisionAI(config)
             ai_planner = AIPlanner(config)
+            if args.mode in offline_modes:
+                logger.info("OpenAI key found - AI scene understanding enabled alongside SLAM")
 
         # World model (sensor fusion)
         threshold = config.get("robot_settings", {}).get("obstacle_distance_threshold_cm", 20.0)
@@ -353,8 +362,23 @@ def main() -> int:
                         image, b64, img_path = camera.capture(save=False)
 
                         if image is not None:
-                            # Get depth estimation
+                            # Get depth estimation and feed obstacle info to the
+                            # world model so the behaviour tree can see walls.
                             depth_map = depth_estimator.estimate_depth(image)
+                            if depth_map:
+                                world_model.update_depth(depth_map)
+
+                            # AI scene understanding (only when an API key is set).
+                            # VisionAI throttles itself, so this is cheap to call.
+                            if vision_ai is not None and b64:
+                                analysis = vision_ai.analyze_scene(b64)
+                                if analysis:
+                                    world_model.update_vision(
+                                        analysis.objects, analysis.hazards, analysis.description
+                                    )
+                                    logger.info(f"AI sees: {analysis.description}")
+                                    if analysis.hazards:
+                                        logger.warning(f"AI hazards: {', '.join(analysis.hazards)}")
 
                             # Process with SLAM
                             pose, map_vis = slam_controller.process_frame(
@@ -387,9 +411,8 @@ def main() -> int:
                     # Execute behavior tree
                     status = behavior_tree.execute(context)
 
-                    # Track last action for odometry hint
-                    # This is a simplification - in real code, track actual executed action
-                    last_action = "forward"  # Placeholder
+                    # Real last executed action → odometry direction hint
+                    last_action = robot.last_action
 
                 else:
                     # Pure SLAM mode - just capture and map, no movement
