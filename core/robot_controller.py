@@ -46,6 +46,11 @@ class BaseRobot:
         """Get distance reading from ultrasonic sensor in cm."""
         return None  # Default: no sensor
 
+    def is_blocking(self) -> bool:
+        """True if forward()/turn_*() block for one gait cycle instead of
+        starting a continuous motion. Default: continuous (non-blocking)."""
+        return False
+
 
 class MockRobot(BaseRobot):
     def __init__(self) -> None:
@@ -88,12 +93,13 @@ class SunFounderPiCrawlerRobot(BaseRobot):
     """
     Adapter around SunFounder picrawler library.
 
-    SunFounder variants differ slightly. Many expose:
-      - do_action(action_name, speed)
-      - do_step(step_or_pose_name, speed)
+    The upstream library exposes:
+      - do_action(motion_name, step=1, speed=50)   e.g. "forward", "turn left"
+      - do_step(step_or_pose_name, speed=50)
 
-    and DO NOT expose forward()/turn_left() methods.
-    This adapter normalizes to BaseRobot primitives.
+    and DOES NOT expose forward()/turn_left()/stop() methods.
+    This adapter normalizes to BaseRobot primitives. Each motion call is one
+    blocking gait cycle; see RobotController._timed_move for repetition.
     """
 
     def __init__(self) -> None:
@@ -124,28 +130,49 @@ class SunFounderPiCrawlerRobot(BaseRobot):
             except Exception as e:
                 self.logger.debug(f"Posture '{pose}' not available: {e}")
 
-    def _do(self, name: str, speed: int) -> None:
+    # SunFounder motion names (note the spaces — these are dict keys in the
+    # library's move_list, and an unknown key only *prints* "No such action").
+    _ACTION_NAMES = {
+        "forward": "forward",
+        "backward": "backward",
+        "turn_left": "turn left",
+        "turn_right": "turn right",
+        "stand": "stand",
+        "sit": "sit",
+    }
+
+    def _do(self, name: str, speed: int, step: int = 1) -> None:
         """
-        Call into the underlying SunFounder API using the best available method.
-        Tries do_action first, then do_step, then a direct callable attribute.
+        Run one SunFounder motion.
+
+        The library signature is ``do_action(motion_name, step=1, speed=50)``.
+        Passing speed positionally lands in the *step* slot and makes the robot
+        repeat the gait `speed` times, so always use keyword arguments.
         """
-        # Most common in SunFounder PiCrawler libs
+        motion = self._ACTION_NAMES.get(name, name)
+
         if hasattr(self.crawler, "do_action"):
             try:
-                self.crawler.do_action(name, speed)  # type: ignore[attr-defined]
+                self.crawler.do_action(motion, step=step, speed=speed)  # type: ignore[attr-defined]
                 return
             except TypeError:
-                # some versions may not take speed for some actions
-                self.crawler.do_action(name)  # type: ignore[attr-defined]
+                pass
+            try:
+                # Older variants without a `step` parameter
+                self.crawler.do_action(motion, speed=speed)  # type: ignore[attr-defined]
+                return
+            except TypeError:
+                # Variants that take no speed at all
+                self.crawler.do_action(motion)  # type: ignore[attr-defined]
                 return
 
-        # Some versions treat actions as named steps
+        # Some variants treat actions as named steps
         if hasattr(self.crawler, "do_step"):
             try:
-                self.crawler.do_step(name, speed)  # type: ignore[attr-defined]
+                self.crawler.do_step(motion, speed=speed)  # type: ignore[attr-defined]
                 return
             except TypeError:
-                self.crawler.do_step(name)  # type: ignore[attr-defined]
+                self.crawler.do_step(motion)  # type: ignore[attr-defined]
                 return
 
         # Last resort: direct method if it exists
@@ -162,65 +189,36 @@ class SunFounderPiCrawlerRobot(BaseRobot):
             f"(no do_action/do_step and no callable attribute)."
         )
 
+    # Each call below performs ONE blocking gait cycle (~1 s). The controller
+    # repeats them to fill the requested duration.
     def forward(self, speed: int) -> None:
-        # common naming in SunFounder actions
         self._do("forward", speed)
 
     def backward(self, speed: int) -> None:
-        # some libs use backward; some use back
-        for name in ("backward", "back"):
-            try:
-                self._do(name, speed)
-                return
-            except Exception as e:
-                self.logger.debug(f"Action '{name}' not available: {e}")
-                continue
-        # last try (will raise if not found):
         self._do("backward", speed)
 
     def turn_left(self, speed: int) -> None:
-        # common naming variants
-        for name in ("turn_left", "left"):
-            try:
-                self._do(name, speed)
-                return
-            except Exception as e:
-                self.logger.debug(f"Action '{name}' not available: {e}")
-                continue
-        # last try (will raise if not found):
         self._do("turn_left", speed)
 
     def turn_right(self, speed: int) -> None:
-        for name in ("turn_right", "right"):
-            try:
-                self._do(name, speed)
-                return
-            except Exception as e:
-                self.logger.debug(f"Action '{name}' not available: {e}")
-                continue
-        # last try (will raise if not found):
         self._do("turn_right", speed)
 
     def stop(self) -> None:
-        # stop often ignores speed; try both call shapes
-        for name in ("stop", "halt"):
-            try:
-                self._do(name, 0)
-                return
-            except Exception as e:
-                self.logger.debug(f"Action '{name}' not available: {e}")
-                continue
-        # If stop isn't a known action, try direct attr without speed
+        # The gait is blocking and finishes on its own; the library has no
+        # "stop" motion. A direct stop() method is used if a variant offers one.
         fn = getattr(self.crawler, "stop", None)
         if callable(fn):
-            fn()
-            return
-        # As a last resort, log critical error (cannot stop robot!)
-        self.logger.error("CRITICAL: No stop() method or stop action available on hardware!")
+            try:
+                fn()
+            except Exception as e:
+                self.logger.debug(f"crawler.stop() failed: {e}")
 
     def posture(self, name: str, speed: int) -> None:
-        # Postures are typically steps
-        self._do(name, speed)
+        self._do(name, speed, step=1)
+
+    def is_blocking(self) -> bool:
+        """Motions block until the gait cycle completes."""
+        return True
 
     def get_distance(self) -> Optional[float]:
         """Get distance reading from ultrasonic sensor in cm.
@@ -339,6 +337,27 @@ class RobotController:
         moving, and the motion is aborted early if an obstacle crosses the
         threshold (instead of driving blind for the full duration).
         """
+        # Blocking gait backends (SunFounder): each start_motion() call is one
+        # full gait cycle, so repeat it until the duration has elapsed and
+        # check the sensor between cycles.
+        if self.robot.is_blocking():
+            deadline = time.time() + duration_s
+            try:
+                while True:
+                    start_motion()
+                    if time.time() >= deadline:
+                        break
+                    if monitor_obstacles and self.has_obstacle():
+                        d = self.get_distance()
+                        self.logger.warning(
+                            "Obstacle at %scm appeared mid-motion - stopping early",
+                            f"{d:.1f}" if d is not None else "?",
+                        )
+                        break
+            finally:
+                self.robot.stop()
+            return
+
         start_motion()
         try:
             if not monitor_obstacles:

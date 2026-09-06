@@ -157,8 +157,14 @@ class SunFounderPiCrawlerRobot(BaseRobot):
                 self.crawler.do_action(motion, step=step, speed=speed)  # type: ignore[attr-defined]
                 return
             except TypeError:
+                pass
+            try:
                 # Older variants without a `step` parameter
                 self.crawler.do_action(motion, speed=speed)  # type: ignore[attr-defined]
+                return
+            except TypeError:
+                # Variants that take no speed at all
+                self.crawler.do_action(motion)  # type: ignore[attr-defined]
                 return
 
         # Some variants treat actions as named steps
