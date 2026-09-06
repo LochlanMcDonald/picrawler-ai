@@ -276,7 +276,7 @@ def run_viewer(port: int, show_3d: bool, refresh_hz: float,
                        head_width=0.08, color="#00c853", zorder=6)
         if loops:
             ax2d.plot([], [], color="red", linewidth=2, label=f"loop closures ({len(loops)})")
-        if traj or loops:
+        if ax2d.get_legend_handles_labels()[0]:
             ax2d.legend(loc="upper right", fontsize=8)
 
         status = f"points: {len(decoder.cloud()):,}   poses: {len(traj)}   loops: {len(loops)}"
