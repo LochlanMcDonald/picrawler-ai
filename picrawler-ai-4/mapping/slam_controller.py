@@ -175,6 +175,8 @@ class SLAMController:
         Returns:
             (corrected_pose, 2D_map_visualization)
         """
+        image = self._to_bgr_array(image)
+
         # ---- 1. Visual odometry ----------------------------------------
         motion: Optional[MotionEstimate] = self.visual_odometry.process_frame(
             image, action_hint
@@ -284,6 +286,17 @@ class SLAMController:
             include_trajectory=True, include_planned_path=True
         )
         return pose, map_vis
+
+    @staticmethod
+    def _to_bgr_array(image) -> np.ndarray:
+        """Accept a numpy array (BGR or gray) or a PIL Image (RGB) and return
+        what OpenCV expects. CameraSystem.capture() returns a PIL Image."""
+        if isinstance(image, np.ndarray):
+            return image
+        if hasattr(image, "convert"):            # PIL.Image.Image
+            rgb = np.asarray(image.convert("RGB"))
+            return np.ascontiguousarray(rgb[:, :, ::-1])
+        raise TypeError(f"Unsupported image type: {type(image).__name__}")
 
     # ------------------------------------------------------------------
     # Occupancy grid update

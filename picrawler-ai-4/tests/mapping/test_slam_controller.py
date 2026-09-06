@@ -103,6 +103,25 @@ class TestProcessFrame:
         assert pose.x == 0.0 and pose.y == 0.0
         assert vis.ndim == 3 and vis.shape[2] == 3
 
+    def test_pil_image_accepted(self):
+        """Regression: CameraSystem.capture() returns a PIL Image, which used to
+        raise "'Image' object has no attribute 'shape'" inside process_frame."""
+        from PIL import Image
+        c = SLAMController(_config())
+        bgr = _frame(0)
+        pil = Image.fromarray(bgr[:, :, ::-1])       # PIL is RGB
+        pose, vis = c.process_frame(pil, _depth())
+        assert c.initialized
+        assert c.point_cloud.point_count() > 0
+        # Colours must come through as RGB after the BGR round-trip
+        cloud = c.point_cloud.get_cloud()
+        assert cloud.colors.shape[1] == 3
+
+    def test_unsupported_image_type_raises(self):
+        c = SLAMController(_config())
+        with pytest.raises(TypeError):
+            c.process_frame("not an image")
+
     def test_grayscale_frame_accepted(self):
         c = SLAMController(_config())
         gray = cv2.cvtColor(_frame(0), cv2.COLOR_BGR2GRAY)
