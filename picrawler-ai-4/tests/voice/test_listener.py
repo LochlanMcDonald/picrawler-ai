@@ -89,3 +89,64 @@ class TestMicrophone:
     def test_recording_failure_falls_back_to_keyboard(self, monkeypatch):
         l, _, _ = self._mic(monkeypatch, record_ok=False)
         assert l.ask("> ", 5.0) == "typed fallback"
+
+
+class TestAutoMode:
+    def test_auto_picks_microphone_when_device_and_client(self, monkeypatch):
+        monkeypatch.setattr(listener_mod, "has_microphone", lambda: True)
+        l = UserListener(_cfg(listen="auto"), openai_client=MagicMock())
+        assert l.mode == "microphone"
+
+    def test_auto_falls_back_without_device(self, monkeypatch):
+        monkeypatch.setattr(listener_mod, "has_microphone", lambda: False)
+        l = UserListener(_cfg(listen="auto"), openai_client=MagicMock())
+        assert l.mode == "keyboard"
+
+    def test_auto_falls_back_without_client(self, monkeypatch):
+        monkeypatch.setattr(listener_mod, "has_microphone", lambda: True)
+        l = UserListener(_cfg(listen="auto"), openai_client=None)
+        assert l.mode == "keyboard"
+
+    def test_default_is_auto(self, monkeypatch):
+        monkeypatch.setattr(listener_mod, "has_microphone", lambda: False)
+        assert UserListener({}).mode == "keyboard"
+
+    def test_mode_override_beats_config(self, monkeypatch):
+        monkeypatch.setattr(listener_mod, "has_microphone", lambda: True)
+        l = UserListener(_cfg(listen="auto"), openai_client=MagicMock(), mode="keyboard")
+        assert l.mode == "keyboard"
+
+    def test_unknown_mode_is_keyboard(self):
+        assert UserListener(_cfg(listen="telepathy")).mode == "keyboard"
+
+
+class TestHasMicrophone:
+    def test_no_arecord(self, monkeypatch):
+        monkeypatch.setattr(listener_mod.shutil, "which", lambda n: None)
+        assert listener_mod.has_microphone() is False
+
+    def test_lists_card(self, monkeypatch):
+        monkeypatch.setattr(listener_mod.shutil, "which", lambda n: "/usr/bin/arecord")
+        monkeypatch.setattr(listener_mod.subprocess, "run",
+                            lambda *a, **k: MagicMock(stdout="**** List of CAPTURE Hardware Devices ****\ncard 1: Device [USB Audio]\n"))
+        assert listener_mod.has_microphone() is True
+
+    def test_no_cards(self, monkeypatch):
+        monkeypatch.setattr(listener_mod.shutil, "which", lambda n: "/usr/bin/arecord")
+        monkeypatch.setattr(listener_mod.subprocess, "run",
+                            lambda *a, **k: MagicMock(stdout="**** List of CAPTURE Hardware Devices ****\n"))
+        assert listener_mod.has_microphone() is False
+
+
+class TestPoll:
+    def test_poll_returns_none_with_injected_input(self):
+        assert UserListener({}, input_fn=lambda p: "x").poll() is None
+
+    def test_poll_returns_none_when_nothing_typed(self, monkeypatch):
+        monkeypatch.setattr(listener_mod.select, "select", lambda *a, **k: ([], [], []))
+        assert UserListener(_cfg(listen="keyboard")).poll() is None
+
+    def test_poll_returns_typed_line(self, monkeypatch):
+        monkeypatch.setattr(listener_mod.select, "select", lambda *a, **k: ([listener_mod.sys.stdin], [], []))
+        monkeypatch.setattr(listener_mod.sys.stdin, "readline", lambda: "quit\n")
+        assert UserListener(_cfg(listen="keyboard")).poll() == "quit"

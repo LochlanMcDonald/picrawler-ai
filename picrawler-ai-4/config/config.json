@@ -107,11 +107,15 @@
   "guided_settings": {
     "answer_timeout_s": 30.0,
     "max_reproposals": 2,
-    "listen": "keyboard",
+    "listen": "auto",
     "listen_seconds": 4,
     "transcribe_model": "whisper-1",
     "forward_duration_s": 1.2,
     "turn_duration_s": 0.8,
-    "backup_duration_s": 1.0
+    "backup_duration_s": 1.0,
+    "autonomy": "ask_always",
+    "confidence_threshold": 0.7,
+    "build_map": true,
+    "map_path": "logs/guided_map_final.jpg"
   }
 }

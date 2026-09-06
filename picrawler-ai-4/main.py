@@ -84,6 +84,13 @@ def parse_args() -> argparse.Namespace:
                   help="Natural language command for language mode")
     p.add_argument("--goal", type=str,
                   help="Navigation goal coordinates as 'x,y' (e.g., '1.5,0.8')")
+    # Guided-mode options (override guided_settings in config.json)
+    p.add_argument("--autonomy", choices=["ask_always", "ask_when_unsure", "ask_forward_only", "never_ask"],
+                  help="Guided mode: when the robot asks before acting")
+    p.add_argument("--listen", choices=["auto", "keyboard", "microphone"],
+                  help="Guided mode: how you answer (auto = microphone if one is found)")
+    p.add_argument("--no-map", action="store_true",
+                  help="Guided mode: do not run SLAM / the map stream underneath")
     return p.parse_args()
 
 
@@ -355,14 +362,26 @@ def main() -> int:
                 decider.client = None
                 logger.warning("No OpenAI key - decisions will be rule-based and there is no scene description")
 
-            listener = UserListener(config, openai_client=openai_client, logger=logger)
+            listener = UserListener(config, openai_client=openai_client, logger=logger, mode=args.listen)
             logger.info(f"Answers via: {listener.mode}  (type yes/no/left/right/forward/back/quit)")
+
+            # Map underneath the conversation (SLAM + UDP stream to tools/map_viewer.py)
+            slam_controller = None
+            build_map = config.get("guided_settings", {}).get("build_map", True) and not args.no_map
+            if build_map:
+                try:
+                    slam_controller = SLAMController(config)
+                    logger.info("Mapping enabled - run tools/map_viewer.py on a laptop to watch it")
+                except Exception as e:
+                    logger.warning(f"Mapping disabled (SLAM init failed: {e})")
 
             explorer = GuidedExplorer(
                 camera=camera, vision_ai=vision_ai, decider=decider, voice=voice,
                 robot=robot, world_model=world_model, memory=memory, listener=listener,
-                depth_estimator=depth_estimator, config=config, logger=logger,
+                depth_estimator=depth_estimator, slam=slam_controller, config=config,
+                autonomy=args.autonomy, logger=logger,
             )
+            logger.info(f"Autonomy: {explorer.autonomy}")
             rc = explorer.run(args.duration)
             logger.info(f"Guided session over: {explorer.cycles} cycles, {explorer.executed} actions")
             return rc

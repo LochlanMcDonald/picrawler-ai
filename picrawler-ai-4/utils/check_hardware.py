@@ -118,6 +118,21 @@ def main() -> int:
     except Exception as e:
         print("ultrasonic       : not available:", e)
 
+    section("7. Microphone / speaker (for guided mode voice answers)")
+    import shutil
+    import subprocess
+    for tool in ("arecord", "aplay", "ffplay", "mpg123"):
+        print(f"  {tool:<8}: {'found' if shutil.which(tool) else 'missing'}")
+    if shutil.which("arecord"):
+        try:
+            out = subprocess.run(["arecord", "-l"], capture_output=True, text=True, timeout=5).stdout
+            cards = [l.strip() for l in out.splitlines() if l.lower().startswith("card")]
+            print("  capture devices:", cards or "NONE (no microphone found)")
+            if cards:
+                print("  → guided mode will answer by voice automatically (listen=auto)")
+        except Exception as e:
+            print("  arecord -l failed:", e)
+
     section("Done")
     print("If a motion above took ~1s but the robot did not move: check the")
     print("battery switch / charge and that the servo cables are seated.")

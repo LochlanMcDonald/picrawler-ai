@@ -366,3 +366,177 @@ class TestRun:
         ex.listener.ask = tick
         ex.run(duration_min=1)     # 60 s → 2 cycles before the clock passes the end
         assert 1 <= len(robot.calls) - 1 <= 2
+
+
+# ---------------------------------------------------------------------------
+# Autonomy policy
+# ---------------------------------------------------------------------------
+
+class PollingListener(ScriptedListener):
+    """Adds poll(): returns queued interjections without blocking."""
+    def __init__(self, answers=(), typed=()):
+        super().__init__(answers)
+        self.typed = list(typed)
+    def poll(self):
+        return self.typed.pop(0) if self.typed else None
+
+
+def _auto(autonomy, decisions, typed=(), answers=(), config=None, robot=None):
+    robot = robot or FakeRobot()
+    voice = FakeVoice()
+    listener = PollingListener(answers, typed)
+    decider = ScriptedDecider(decisions)
+    cfg = dict(config or {})
+    ex = GuidedExplorer(
+        camera=FakeCamera(), vision_ai=FakeVision(), decider=decider, voice=voice,
+        robot=robot, world_model=WorldModel(obstacle_threshold_cm=20.0),
+        memory=SpatialMemory(history_size=20), listener=listener, config=cfg,
+        autonomy=autonomy, clock=lambda: 0.0, sleep=lambda s: None,
+    )
+    return ex, voice, robot, listener
+
+
+class TestAutonomy:
+    def test_unknown_mode_falls_back_to_ask_always(self):
+        ex, *_ = _auto("yolo", [])
+        assert ex.autonomy == "ask_always"
+
+    def test_config_autonomy_used_when_no_override(self):
+        ex, *_ = _auto(None, [], config={"guided_settings": {"autonomy": "never_ask"}})
+        assert ex.autonomy == "never_ask"
+
+    def test_never_ask_narrates_and_acts(self):
+        ex, voice, robot, listener = _auto("never_ask", [Decision("turn_left", "more room", 0.9)])
+        assert ex.step() is True
+        assert robot.calls == [("turn_left", 0.8)]
+        assert any(s.startswith("I'll turn left because more room") for s in voice.spoken)
+        assert listener.prompts == []                       # never waited for an answer
+
+    def test_ask_forward_only_asks_for_forward(self):
+        ex, voice, robot, listener = _auto("ask_forward_only", [Decision("forward", "clear", 0.9)], answers=["yes"])
+        ex.step()
+        assert len(listener.prompts) == 1
+        assert robot.calls == [("forward", 1.2)]
+
+    def test_ask_forward_only_does_not_ask_for_turns(self):
+        ex, voice, robot, listener = _auto("ask_forward_only", [Decision("turn_right", "r", 0.9)])
+        ex.step()
+        assert listener.prompts == []
+        assert robot.calls == [("turn_right", 0.8)]
+
+    def test_ask_when_unsure_confident_ai_acts(self):
+        ex, _, robot, listener = _auto("ask_when_unsure", [Decision("forward", "r", 0.95, source="ai")])
+        ex.step()
+        assert listener.prompts == []
+        assert robot.calls == [("forward", 1.2)]
+
+    def test_ask_when_unsure_low_confidence_asks(self):
+        ex, _, robot, listener = _auto("ask_when_unsure", [Decision("forward", "r", 0.3, source="ai")], answers=["no", "quit"])
+        assert ex.step() is False
+        assert len(listener.prompts) >= 1
+        assert robot.calls == []
+
+    def test_ask_when_unsure_rule_based_asks(self):
+        ex, _, robot, listener = _auto("ask_when_unsure", [Decision("forward", "r", 0.99, source="rule")], answers=["yes"])
+        ex.step()
+        assert len(listener.prompts) == 1
+
+    def test_ask_when_unsure_threshold_from_config(self):
+        ex, _, _, listener = _auto("ask_when_unsure", [Decision("forward", "r", 0.75, source="ai")],
+                                   answers=["yes"], config={"guided_settings": {"confidence_threshold": 0.9}})
+        ex.step()
+        assert len(listener.prompts) == 1
+
+    def test_autonomous_forward_is_still_safety_gated(self):
+        robot = FakeRobot(distance=5.0, obstacle=True)
+        ex, voice, robot, _ = _auto("never_ask", [Decision("forward", "r", 0.9)], robot=robot)
+        ex.step()
+        assert robot.calls == [("stop", 0.2)]
+        assert any("too close" in s for s in voice.spoken)
+
+
+class TestInterjections:
+    def test_typed_quit_stops_autonomous_loop(self):
+        ex, _, robot, _ = _auto("never_ask", [Decision("forward", "r", 0.9)], typed=["quit"])
+        assert ex.step() is False
+        assert robot.calls == []
+
+    def test_typed_instruction_overrides(self):
+        ex, voice, robot, _ = _auto("never_ask", [Decision("forward", "r", 0.9)], typed=["left"])
+        ex.step()
+        assert robot.calls == [("turn_left", 0.8)]
+        assert any("turn left instead" in s for s in voice.spoken)
+
+    def test_typed_no_pauses_and_asks(self):
+        ex, voice, robot, listener = _auto("never_ask", [Decision("forward", "r", 0.9)],
+                                           typed=["no"], answers=["yes"])
+        ex.step()
+        assert any("ask you first" in s for s in voice.spoken)
+        assert len(listener.prompts) == 1
+        assert robot.calls == [("forward", 1.2)]
+        assert ex.autonomy == "never_ask"          # restored after the one-off ask
+
+    def test_typed_no_then_no_stays_put(self):
+        ex, voice, robot, _ = _auto("never_ask", [Decision("forward", "r", 0.9)], typed=["no"], answers=["no"])
+        ex.step()
+        assert robot.calls == []
+        assert any("stay put" in s for s in voice.spoken)
+
+    def test_listener_without_poll_is_fine(self):
+        ex, _, robot, _ = _auto("never_ask", [Decision("forward", "r", 0.9)])
+        ex.listener = ScriptedListener([])        # no poll() method at all
+        ex.step()
+        assert robot.calls == [("forward", 1.2)]
+
+
+# ---------------------------------------------------------------------------
+# Mapping underneath
+# ---------------------------------------------------------------------------
+
+class FakeSlam:
+    def __init__(self, fail=False):
+        self.frames = []
+        self.saved = None
+        self.shut = False
+        self.fail = fail
+    def process_frame(self, image, depth, action_hint=None):
+        if self.fail:
+            raise RuntimeError("vo exploded")
+        self.frames.append(action_hint)
+        return None, None
+    def save_map(self, path):
+        self.saved = path
+    def get_statistics(self):
+        return {"map": {"explored_percent": 3.0}, "slam": {"loop_closures": 0}, "point_cloud": {"points": 12}}
+    def shutdown(self):
+        self.shut = True
+
+
+class TestMapping:
+    def test_slam_receives_each_frame_with_last_action(self):
+        ex, _, robot, _, _ = _explorer(["yes", "yes"])
+        slam = FakeSlam()
+        ex.slam = slam
+        robot.last_action = None
+        ex.step()
+        robot.last_action = "forward"
+        ex.step()
+        assert slam.frames == [None, "forward"]
+
+    def test_slam_failure_does_not_break_cycle(self):
+        ex, _, robot, _, _ = _explorer(["yes"])
+        ex.slam = FakeSlam(fail=True)
+        ex.step()
+        assert robot.calls == [("forward", 1.2)]
+
+    def test_run_saves_map_and_shuts_down(self, tmp_path):
+        ex, _, _, _, _ = _explorer(["quit"], config={"guided_settings": {"map_path": str(tmp_path / "m.jpg")}})
+        slam = FakeSlam()
+        ex.slam = slam
+        ex.run(1)
+        assert slam.saved == str(tmp_path / "m.jpg")
+        assert slam.shut is True
+
+    def test_no_slam_is_default(self):
+        ex, *_ = _explorer(["quit"])
+        assert ex.slam is None

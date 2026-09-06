@@ -28,6 +28,7 @@ from typing import Callable, Dict, List, Optional
 # ---------------------------------------------------------------------------
 
 VALID_ACTIONS = ("forward", "backward", "turn_left", "turn_right", "stop")
+AUTONOMY_MODES = ("ask_always", "ask_when_unsure", "ask_forward_only", "never_ask")
 
 _PHRASES = {
     "forward": "walk forward",
@@ -240,7 +241,8 @@ def interpret_answer(text: Optional[str]) -> Answer:
 class GuidedExplorer:
     def __init__(self, *,
                  camera, vision_ai, decider, voice, robot, world_model, memory, listener,
-                 depth_estimator=None, config: Optional[dict] = None,
+                 depth_estimator=None, slam=None, config: Optional[dict] = None,
+                 autonomy: Optional[str] = None,
                  logger: Optional[logging.Logger] = None,
                  clock: Callable[[], float] = time.time,
                  sleep: Callable[[float], None] = time.sleep):
@@ -253,6 +255,7 @@ class GuidedExplorer:
         self.memory = memory
         self.listener = listener
         self.depth_estimator = depth_estimator
+        self.slam = slam                    # optional SLAMController (map while guided)
         self.logger = logger or logging.getLogger(self.__class__.__name__)
         self.clock = clock
         self.sleep = sleep
@@ -261,6 +264,18 @@ class GuidedExplorer:
         bt = (config or {}).get("behavior_tree_settings", {})
         self.answer_timeout_s = float(g.get("answer_timeout_s", 30.0))
         self.max_reproposals = int(g.get("max_reproposals", 2))
+
+        # Autonomy policy — when does the robot ask before acting?
+        #   ask_always        every action (default)
+        #   ask_when_unsure   only if AI confidence < confidence_threshold
+        #   ask_forward_only  only before walking forward; turns/backing are narrated
+        #   never_ask         narrate and act; you can still type stop/quit/instructions
+        self.autonomy = str(autonomy or g.get("autonomy", "ask_always")).lower()
+        if self.autonomy not in AUTONOMY_MODES:
+            self.logger.warning(f"Unknown autonomy {self.autonomy!r} — using ask_always")
+            self.autonomy = "ask_always"
+        self.confidence_threshold = float(g.get("confidence_threshold", 0.7))
+        self.map_path = str(g.get("map_path", "logs/guided_map_final.jpg"))
         self.durations = {
             "forward": float(g.get("forward_duration_s", bt.get("move_forward_duration_s", 1.2))),
             "backward": float(g.get("backup_duration_s", bt.get("backup_duration_s", 1.0))),
@@ -296,6 +311,22 @@ class GuidedExplorer:
             self.robot.execute("stop", 0.2)
         except Exception:
             pass
+        if self.slam is not None:
+            try:
+                self.slam.save_map(self.map_path)
+                stats = self.slam.get_statistics()
+                self.logger.info(
+                    f"Map saved to {self.map_path}: "
+                    f"{stats['map'].get('explored_percent', 0):.1f}% explored, "
+                    f"{stats['slam'].get('loop_closures', 0)} loop closures, "
+                    f"{stats['point_cloud'].get('points', 0)} cloud points"
+                )
+            except Exception as e:
+                self.logger.warning(f"Could not save map: {e}")
+            try:
+                self.slam.shutdown()
+            except Exception:
+                pass
         return 0
 
     # ------------------------------------------------------------------
@@ -321,6 +352,8 @@ class GuidedExplorer:
             decision = self.decider.decide(
                 self.world_model.to_dict(), description, hazards, self.recent_actions, rejected
             )
+            if attempt == 0 and not self._needs_approval(decision):
+                return self._act_autonomously(decision)
             if attempt == 0:
                 self.say(f"I'd like to {decision.phrase()} because {decision.reasoning}. Is that a good choice?")
             else:
@@ -360,6 +393,65 @@ class GuidedExplorer:
         return True
 
     # ------------------------------------------------------------------
+    # Autonomy
+    # ------------------------------------------------------------------
+
+    def _needs_approval(self, decision: Decision) -> bool:
+        if self.autonomy == "ask_always":
+            return True
+        if self.autonomy == "never_ask":
+            return False
+        if self.autonomy == "ask_forward_only":
+            return decision.action == "forward"
+        # ask_when_unsure
+        return decision.confidence < self.confidence_threshold or decision.source != "ai"
+
+    def _act_autonomously(self, decision: Decision) -> bool:
+        """Narrate and act without waiting, but honour anything already typed."""
+        self.say(f"I'll {decision.phrase()} because {decision.reasoning}.")
+
+        typed = None
+        try:
+            typed = self.listener.poll()
+        except Exception:
+            typed = None
+        if typed:
+            answer = interpret_answer(typed)
+            self.logger.info(f"Interjection: {answer.kind} {answer.action or ''} ({answer.raw!r})")
+            if answer.kind == "quit":
+                return False
+            if answer.kind == "instruction":
+                self.say(f"Okay, I'll {_PHRASES.get(answer.action, answer.action)} instead.")
+                self._act(Decision(answer.action, "you asked me to", 1.0, source="user"))
+                return True
+            if answer.kind == "no":
+                self.say("Okay, I'll hold on and ask you first.")
+                # Fall back to the normal ask flow for this cycle
+                prev, self.autonomy = self.autonomy, "ask_always"
+                try:
+                    return self._ask_and_act(decision)
+                finally:
+                    self.autonomy = prev
+
+        self._act(decision)
+        return True
+
+    def _ask_and_act(self, decision: Decision) -> bool:
+        self.say(f"Should I {decision.phrase()}?")
+        answer = interpret_answer(self.listener.ask("Your answer (yes / no / left / right / forward / back / quit): ",
+                                                    self.answer_timeout_s))
+        if answer.kind == "quit":
+            return False
+        if answer.kind == "yes":
+            self._act(decision)
+        elif answer.kind == "instruction":
+            self.say(f"Okay, I'll {_PHRASES.get(answer.action, answer.action)}.")
+            self._act(Decision(answer.action, "you asked me to", 1.0, source="user"))
+        else:
+            self.say("Okay, I'll stay put and look again.")
+        return True
+
+    # ------------------------------------------------------------------
 
     def _look(self):
         description, hazards = "", []
@@ -377,6 +469,7 @@ class GuidedExplorer:
         if image is None:
             return description, hazards
 
+        depth = None
         if self.depth_estimator is not None:
             try:
                 depth = self.depth_estimator.estimate_depth(image)
@@ -384,6 +477,15 @@ class GuidedExplorer:
                     self.world_model.update_depth(depth)
             except Exception as e:
                 self.logger.debug(f"Depth failed: {e}")
+
+        # Build the map underneath the conversation (optional)
+        if self.slam is not None:
+            try:
+                self.slam.process_frame(
+                    image, depth, action_hint=getattr(self.robot, "last_action", None)
+                )
+            except Exception as e:
+                self.logger.warning(f"SLAM frame failed: {e}")
 
         if b64 and self.vision_ai is not None:
             analysis = self.vision_ai.analyze_scene(b64)

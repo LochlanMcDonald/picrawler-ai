@@ -2,15 +2,17 @@
 User input for conversational modes — keyboard or microphone.
 
 The robot asks a question out loud (VoiceSystem) and then waits here for the
-answer.  Two backends:
+answer.  Backends:
 
-  keyboard    — type the answer in the terminal (default, always works)
+  keyboard    — type the answer in the terminal (always works)
   microphone  — record with `arecord` and transcribe with OpenAI; falls back
                 to the keyboard if recording or transcription fails
+  auto        — microphone if `arecord` finds a capture device and an OpenAI
+                client is available, otherwise keyboard  (default)
 
 Configure under "guided_settings" in config.json:
 
-    "listen": "keyboard" | "microphone",
+    "listen": "auto" | "keyboard" | "microphone",
     "listen_seconds": 4,            # microphone recording length
     "transcribe_model": "whisper-1"
 """
@@ -26,27 +28,48 @@ import tempfile
 from typing import Callable, Optional
 
 
+def has_microphone() -> bool:
+    """True if `arecord -l` lists at least one capture device."""
+    if shutil.which("arecord") is None:
+        return False
+    try:
+        out = subprocess.run(["arecord", "-l"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return False
+    return "card" in out.lower()
+
+
 class UserListener:
     def __init__(self,
                  config: Optional[dict] = None,
                  openai_client=None,
                  input_fn: Optional[Callable[[str], str]] = None,
-                 logger: Optional[logging.Logger] = None):
+                 logger: Optional[logging.Logger] = None,
+                 mode: Optional[str] = None):
         cfg = (config or {}).get("guided_settings", {}) if isinstance(config, dict) else {}
         self.logger = logger or logging.getLogger(self.__class__.__name__)
-        self.mode = str(cfg.get("listen", "keyboard")).lower()
+        self.mode = str(mode or cfg.get("listen", "auto")).lower()
         self.listen_seconds = float(cfg.get("listen_seconds", 4.0))
         self.transcribe_model = str(cfg.get("transcribe_model", "whisper-1"))
         self.client = openai_client
         self._input_fn = input_fn   # injectable for tests; None → stdin with timeout
 
-        if self.mode == "microphone":
+        if self.mode == "auto":
+            if self.client is not None and has_microphone():
+                self.mode = "microphone"
+                self.logger.info("Microphone detected — answers by voice (keyboard still works)")
+            else:
+                self.mode = "keyboard"
+        elif self.mode == "microphone":
             if shutil.which("arecord") is None:
                 self.logger.warning("listen=microphone but `arecord` not found — using keyboard")
                 self.mode = "keyboard"
             elif self.client is None:
                 self.logger.warning("listen=microphone but no OpenAI client — using keyboard")
                 self.mode = "keyboard"
+        elif self.mode != "keyboard":
+            self.logger.warning(f"Unknown listen mode {self.mode!r} — using keyboard")
+            self.mode = "keyboard"
 
     # ------------------------------------------------------------------
 
@@ -58,6 +81,25 @@ class UserListener:
                 return text
             self.logger.info("Microphone gave nothing — falling back to keyboard")
         return self._listen_keyboard(prompt, timeout_s)
+
+    def poll(self) -> Optional[str]:
+        """Non-blocking: return a line the user has already typed, else None.
+
+        Used by autonomous guided modes so you can still type `stop`, `quit`
+        or an instruction while the robot is acting on its own. Never records
+        from the microphone.
+        """
+        if self._input_fn is not None:
+            return None
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            return None
+        line = sys.stdin.readline()
+        text = (line or "").strip()
+        return text or None
 
     # ------------------------------------------------------------------
 
